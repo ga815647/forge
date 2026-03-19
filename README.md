@@ -51,11 +51,6 @@ pip install -r requirements.txt
 python -m forge.main
 ```
 
-或直接：
-
-```bash
-python forge/main.py
-```
 
 開啟後在瀏覽器存取 Gradio UI（預設 `http://localhost:7860`）。
 
