@@ -68,7 +68,7 @@ def build_main_ui(cfg: dict, chat_fn, stop_fn, rollback_fn, commits_fn, cost_sum
                                   label="模式", scale=2)
             review_chk = gr.Checkbox(value=cfg.get("review_mode", False), label="審核模式", scale=1)
 
-        chatbot = gr.Chatbot(type="messages", height=500, label="Forge")
+        chatbot = gr.Chatbot(height=500, label="Forge")
 
         with gr.Row():
             msg_box = gr.Textbox(placeholder="輸入你的需求或指令...", label="", scale=6, lines=2)
