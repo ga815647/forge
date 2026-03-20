@@ -22,6 +22,7 @@ def run(
     engine: str,
     on_log: Callable[[str], None] | None = None,
     review_mode: bool = False,
+    skip_clarification: bool = False,
 ) -> dict:
     """Run first-time initialization. Returns {"plan": str, "agent_dir": Path}."""
 
@@ -106,6 +107,27 @@ def run(
         f"path={recon_path}, chars={len(recon_result)}, preview={summarize_text(recon_result, 140)}"
     )
     log("Manifest rebuilt after recon output")
+
+    # ── Step 5.5: clarification gate ─────────────────────────────────────
+    log("🔍 分析 prompt 歧義與 recon 衝突...")
+    interpretations = _detect_ambiguity(user_input)
+    conflicts = _detect_conflicts(user_input, recon_result)
+    recon_summary = _summarize_recon(recon_result)
+
+    if not skip_clarification and (interpretations or conflicts):
+        log(f"Clarification needed: interpretations={len(interpretations)}, conflicts={len(conflicts)}")
+        clarification_msg = _prompts.clarification_prompt(
+            user_input, recon_summary, interpretations, conflicts
+        )
+        return {
+            "plan": clarification_msg,
+            "agent_dir": agent_dir,
+            "needs_clarification": True,
+            "pending_input": user_input,
+            "recon_result": recon_result,
+        }
+    else:
+        log("Clarification gate passed: no ambiguity or conflicts detected")
 
     # ── Step 6: pre-flight think() ────────────────────────────────────────
     log(
@@ -362,6 +384,94 @@ def _init_context(agent_dir: Path, engine: str, recon: str) -> None:
 
     context = "\n\n".join(parts)
     safe_write(agent_dir / "upper" / "context.md", context)
+
+
+def _detect_ambiguity(user_input: str) -> list[str]:
+    """Return possible interpretations if the prompt is ambiguous.
+
+    Uses simple heuristics: short prompt + vague verb = ambiguous.
+    Returns empty list if prompt is clear enough to proceed.
+    """
+    VAGUE_VERBS = {"優化", "改進", "修改", "調整", "更新", "整理", "處理",
+                   "optimize", "improve", "update", "fix", "refactor", "change"}
+    words = user_input.strip().split()
+    is_short = len(words) <= 6
+    has_vague_verb = any(v in user_input for v in VAGUE_VERBS)
+
+    if not (is_short and has_vague_verb):
+        return []
+
+    interpretations: list[str] = []
+    if "優化" in user_input or "optimize" in user_input.lower():
+        interpretations = [
+            "效能優化（減少 API call 次數、降低記憶體用量）",
+            "程式碼品質優化（重構、減少重複）",
+            "使用者體驗優化（介面、回應速度）",
+        ]
+    elif "修改" in user_input or "改" in user_input or "fix" in user_input.lower():
+        interpretations = [
+            "修正某個已知的 bug",
+            "調整現有功能的行為",
+            "重寫某個模組",
+        ]
+    else:
+        interpretations = [
+            f"針對整個專案做 {user_input.strip()}",
+            f"針對特定模組做 {user_input.strip()}",
+        ]
+
+    return interpretations
+
+
+def _detect_conflicts(user_input: str, recon_result: str) -> list[str]:
+    """Detect conflicts between user assumptions and actual project state.
+
+    Returns list of conflict descriptions, empty if no conflicts found.
+    """
+    import re
+    conflicts: list[str] = []
+
+    # 使用者提到的技術/檔案是否存在於 recon
+    mentioned_files = re.findall(r'[\w./]+\.\w{2,4}', user_input)
+    for f in mentioned_files:
+        if f not in recon_result:
+            conflicts.append(f"你提到 `{f}`，但我在專案裡找不到這個檔案")
+
+    mentioned_frameworks = {
+        "react": ["react", "React"],
+        "vue": ["vue", "Vue"],
+        "django": ["django", "Django"],
+        "fastapi": ["fastapi", "FastAPI"],
+        "express": ["express", "Express"],
+    }
+    for fw, variants in mentioned_frameworks.items():
+        if fw.lower() in user_input.lower():
+            if not any(v in recon_result for v in variants):
+                conflicts.append(f"你提到 {variants[0]}，但 recon 沒有發現這個框架")
+
+    return conflicts
+
+
+def _summarize_recon(recon_result: str) -> str:
+    """Return a short human-readable summary of recon result.
+
+    Extracts key signals: language, framework, file count, last commit.
+    """
+    lines = recon_result.splitlines()
+    summary_lines: list[str] = []
+
+    for line in lines:
+        if any(kw in line for kw in ["package.json", "pyproject.toml", "Cargo.toml", "go.mod"]):
+            summary_lines.append(f"- 設定檔：{line.strip()}")
+        if "git log" in line.lower() or line.strip().startswith("*"):
+            summary_lines.append(f"- 最近 commit：{line.strip()}")
+        if "個檔案" in line or "files" in line.lower():
+            summary_lines.append(f"- 規模：{line.strip()}")
+
+    if not summary_lines:
+        return recon_result[:300]
+
+    return "\n".join(summary_lines[:6])
 
 
 def _is_large_task(plan_content: str) -> bool:

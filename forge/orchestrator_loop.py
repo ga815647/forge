@@ -87,6 +87,30 @@ def run(
     if not anomalies:
         log("Manifest verification passed with no anomalies")
 
+    tokens_used = 0
+
+    # ── Step 1.7: recon staleness check (every 10 rounds) ────────────────
+    if round_num % 10 == 0:
+        log("🔍 檢查 recon 有效期...")
+        stale_warning = _check_recon_staleness(agent_dir, round_num)
+        if stale_warning:
+            log(f"Recon staleness warning: {stale_warning}")
+            return {
+                "status": "needs_clarification",
+                "round": round_num,
+                "tokens": tokens_used,
+                "summary": (
+                    f"## ⚠️ 程式認識可能已過期\n\n"
+                    f"{stale_warning}\n\n"
+                    f"---\n"
+                    f"請回覆：\n"
+                    f"- **繼續** — 用現有認識繼續執行\n"
+                    f"- **重新認識** — 重跑 recon，更新對程式的理解\n"
+                ),
+            }
+        else:
+            log("Recon staleness check passed")
+
     # ── Step 2: decide flow ───────────────────────────────────────────────
     plan = read_file(agent_dir / "plan.md")
     prev_summary_path = (
@@ -101,8 +125,6 @@ def run(
     )
 
     # ── Step 3: think() (normal mode only) ───────────────────────────────
-    tokens_used = 0
-
     if not use_lightweight:
         # ── Review gate（在 think() 之前）────────────────────────────────
         if review_mode:
@@ -211,6 +233,32 @@ def run(
     save_summary(summary_path, round_num, do_result)
     log(f"Round summary saved: {summary_path}")
 
+    # ── Step 5.5: update purpose direction ────────────────────────────────
+    purpose_path = agent_dir / "purpose.md"
+    if purpose_path.exists():
+        log("📝 更新 purpose.md 方向累積...")
+        current_purpose = read_file(purpose_path)
+        direction_update = _agent.think(
+            _prompts.purpose_update_prompt(
+                current_purpose,
+                user_message,
+                do_result,
+            ),
+            context_files=[],
+            engine=engine,
+            cwd=agent_dir,
+            model="sonnet",
+        )
+        if direction_update.strip() and "無新方向訊號" not in direction_update:
+            updated_purpose = current_purpose.rstrip() + "\n\n" + direction_update.strip()
+            safe_write(purpose_path, updated_purpose)
+            update_manifest(purpose_path)
+            log(f"Purpose direction updated: {summarize_text(direction_update, 120)}")
+        else:
+            log("Purpose update skipped: no new directional signal this round")
+    else:
+        log("Purpose update skipped: purpose.md not found")
+
     # ── Step 6: audit ──────────────────────────────────────────────────────
     log("🔎 執行 audit...")
     audit_results = _audit.run_audit(project_path, on_log=log)
@@ -314,6 +362,25 @@ def run(
 
 
 # ── Simple inline helpers ─────────────────────────────────────────────────────
+
+
+def _check_recon_staleness(agent_dir: Path, round_num: int) -> str | None:
+    """Check if the recon data might be stale based on round count and file changes.
+
+    Returns a warning string if stale, None if still fresh.
+    """
+    recon_path = agent_dir / "recon.md"
+    if not recon_path.exists():
+        return None
+
+    # Heuristic: if we're past round 20, recon is probably outdated
+    if round_num >= 20:
+        return (
+            f"目前是第 {round_num} 輪，初始 recon 是在第 1 輪做的。"
+            f"專案結構可能已經改變，建議重新認識一次。"
+        )
+
+    return None
 
 
 def _should_use_lightweight(plan: str, prev_summary: str) -> bool:

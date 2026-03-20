@@ -18,6 +18,8 @@ class _Session:
         self.project_path: Path | None = None
         self.session_guard = None
         self.pending_review: bool = False
+        self.pending_clarification: bool = False
+        self.pending_input: str = ""
         self._lock = threading.Lock()
         self._init_tracker()
         self._init_approved()
@@ -43,6 +45,8 @@ class _Session:
             self.round_num = 1
             self.session_guard = None
             self.pending_review = False
+            self.pending_clarification = False
+            self.pending_input = ""
             self._init_tracker()
             self._init_approved()
 
@@ -91,7 +95,22 @@ def _format_live_log(log_lines: list[str]) -> str:
 
 
 def _format_response(status: str, output: str, log_lines: list[str], running: bool) -> str:
-    """Render the assistant bubble with status and current backend log."""
+    """Render the assistant bubble with status and current backend log.
+
+    Blocking statuses (needs_clarification, needs_review) get a distinct
+    visual treatment to ensure the user notices they must reply.
+    """
+    BLOCKING_STATUSES = ("needs_clarification", "needs_review")
+
+    if status in BLOCKING_STATUSES and output.strip():
+        # Blocking bubble: output is the whole content, no status prefix, no log
+        parts = [
+            "> ⏸ **Forge 正在等待你的回覆，請回答後才能繼續。**",
+            "",
+            output.strip(),
+        ]
+        return "\n".join(parts)
+
     parts = [f"**Status**: {status}"]
 
     if output.strip():

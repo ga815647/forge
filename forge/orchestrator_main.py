@@ -101,6 +101,26 @@ def format_hardblock_message(reason: str, detail: str) -> str:
     )
 
 
+def parse_clarification_reply(user_input: str) -> str:
+    """Parse user reply to a clarification bubble.
+
+    Returns:
+        'proceed'   - user confirms, continue as-is
+        'abort'     - user explicitly cancels
+        'rerecon'   - user wants to refresh project understanding
+    Fuzzy matching: unrecognised replies default to 'proceed'.
+    """
+    stripped = user_input.strip()
+    ABORT_WORDS = {"終止", "停止", "取消", "不要", "算了", "abort", "cancel", "stop"}
+    RERECON_WORDS = {"重新認識", "重新掃描", "更新認識", "recon", "re-recon", "rescan"}
+
+    if stripped.lower() in ABORT_WORDS:
+        return "abort"
+    if any(w in stripped for w in RERECON_WORDS):
+        return "rerecon"
+    return "proceed"
+
+
 def parse_review_reply(user_input: str) -> str:
     """解析 needs_review 後的使用者回覆。
     回傳 'terminate' | 'continue' | 'correction:<text>'
@@ -261,8 +281,20 @@ def handle_input(
             f"needs_review={result.get('needs_review', False)}, "
             f"plan_chars={len(result.get('plan', ''))}"
         )
-        _status = "needs_review" if result.get("needs_review") else "initialized"
-        if _status == "needs_review":
+        if result.get("needs_clarification"):
+            _status = "needs_clarification"
+        elif result.get("needs_review"):
+            _status = "needs_review"
+        else:
+            _status = "initialized"
+        if _status == "needs_clarification":
+            from . import main as _main_module
+            _sess = getattr(_main_module, "_session", None)
+            if _sess is not None:
+                _sess.pending_clarification = True
+                _sess.pending_input = user_input
+                log("pending_clarification 已設為 True，等待使用者回覆")
+        elif _status == "needs_review":
             from . import main as _main_module
             _sess = getattr(_main_module, "_session", None)
             if _sess is not None:
@@ -277,8 +309,62 @@ def handle_input(
         # Continuation: run one loop round
         log("Found existing Forge state; continuing main loop")
 
-        # ── Review reply handling ──────────────────────────────────────
+        # ── Clarification reply handling ───────────────────────────────────
         from . import main as _main_module
+        _sess = getattr(_main_module, "_session", None)
+        if _sess is not None and getattr(_sess, "pending_clarification", False):
+            _sess.pending_clarification = False
+            reply = parse_clarification_reply(user_input)
+            log(f"Clarification reply parsed: {reply}")
+
+            if reply == "abort":
+                log("使用者選擇中止，不繼續執行")
+                return {
+                    "status": "blocked",
+                    "output": "已取消。你可以重新描述需求再試一次。",
+                    "round": round_num,
+                }
+
+            if reply == "rerecon":
+                log("使用者要求重新認識程式，重跑 recon...")
+                from .orchestrator_init import _fast_recon
+                from .security import safe_write, update_manifest, build_manifest
+                new_recon = _fast_recon(project_path)
+                recon_path = agent_dir / "recon.md"
+                safe_write(recon_path, new_recon)
+                build_manifest(agent_dir)
+                log(f"Recon refreshed: chars={len(new_recon)}")
+                return {
+                    "status": "continue",
+                    "output": "已更新對程式的認識，繼續執行。",
+                    "round": round_num,
+                }
+
+            # proceed: run init again with stored pending input
+            pending_input = getattr(_sess, "pending_input", user_input)
+            log(f"Proceeding with clarified input: {summarize_text(pending_input, 80)}")
+            result = _init.run(
+                pending_input,
+                uploaded_files,
+                project_path,
+                engine,
+                on_log=on_log,
+                review_mode=review_mode,
+                skip_clarification=True,
+            )
+            if result.get("needs_clarification"):
+                _status = "needs_clarification"
+            elif result.get("needs_review"):
+                _status = "needs_review"
+            else:
+                _status = "initialized"
+            return {
+                "status": _status,
+                "output": result.get("plan", "初始化完成"),
+                "round": round_num,
+            }
+
+        # ── Review reply handling ──────────────────────────────────────
         _sess = getattr(_main_module, "_session", None)
         if _sess is not None and getattr(_sess, "pending_review", False):
             _sess.pending_review = False
@@ -346,12 +432,15 @@ def handle_input(
         elif status == "blocked":
             notify("Forge ⚠️", "需要你的決定")
 
-        if status == "needs_review":
+        if status in ("needs_review", "needs_clarification"):
             from . import main as _main_module
             _sess = getattr(_main_module, "_session", None)
             if _sess is not None:
-                _sess.pending_review = True
-                log("pending_review 已設為 True，等待使用者回覆")
+                if status == "needs_clarification":
+                    _sess.pending_clarification = True
+                else:
+                    _sess.pending_review = True
+                log(f"pending state 已設為 True：{status}")
 
         return {
             "status": status,

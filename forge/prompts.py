@@ -219,6 +219,78 @@ def reality_check_prompt(recon: str, context: str) -> str:
 {ANTI_HALLUCINATION}"""
 
 
+def clarification_prompt(
+    user_input: str,
+    recon_summary: str,
+    interpretations: list[str],
+    conflicts: list[str],
+) -> str:
+    """Generate a blocking clarification message for the user.
+
+    Covers: prompt ambiguity, recon confirmation, assumption conflicts.
+    All three are shown in one message to avoid multiple round-trips.
+    """
+    parts: list[str] = []
+
+    parts.append("## 👀 Forge 在開始前需要你確認幾件事\n")
+    parts.append("請直接回覆。模糊回答沒關係，Forge 會推斷你的意圖。\n")
+    parts.append("---\n")
+
+    if interpretations:
+        parts.append("### 1. 你的需求，我的解讀")
+        parts.append("我把你說的理解成以下幾種可能，請確認哪個最接近：")
+        for i, interp in enumerate(interpretations, 1):
+            parts.append(f"  {i}. {interp}")
+        parts.append("")
+
+    parts.append("### 2. 我對這個程式的認識")
+    parts.append(recon_summary)
+    parts.append("（這個認識正確嗎？有哪裡不對請告訴我。）\n")
+
+    if conflicts:
+        parts.append("### 3. 我發現以下可能的衝突")
+        for c in conflicts:
+            parts.append(f"  - {c}")
+        parts.append("")
+
+    parts.append("---")
+    parts.append("你可以直接說「對」、「繼續」，或針對任何一點補充說明。")
+
+    return "\n".join(parts)
+
+
+def purpose_update_prompt(
+    current_purpose: str,
+    user_message: str,
+    do_result: str,
+) -> str:
+    """Generate a prompt to incrementally update purpose.md based on this round's signals.
+
+    Extracts directional intent from user_message and do_result,
+    appends to the existing purpose without overwriting it.
+    """
+    return f"""你是 Forge 的方向追蹤器。
+
+## 目前的 purpose.md
+{current_purpose}
+
+## 這輪使用者說的話
+{user_message}
+
+## 這輪做了什麼
+{do_result[:400]}
+
+請只補充「## 累積方向」這個區段。格式：
+- 從使用者這輪的話，推斷出對程式方向有意義的新資訊
+- 若無新資訊，輸出「（本輪無新方向訊號）」
+- 不要修改 purpose.md 的其他區段
+- 不要重複已經記錄過的內容
+
+只輸出「## 累積方向」這個區段的新增內容，不要輸出整份 purpose.md。
+
+{ANTI_HALLUCINATION}"""
+
+
 def doc_prompt(purpose: str, architecture: str, timeline: str) -> str:
     return f"""根據以下文件生成專案文件。
 
