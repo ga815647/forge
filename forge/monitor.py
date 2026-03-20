@@ -46,6 +46,10 @@ def monitor_process(
             output_parts.append(raw_line)
             continue
 
+        if not isinstance(obj, dict):
+            output_parts.append(raw_line)
+            continue
+
         # Extract text content
         _extract_text(obj, output_parts)
 
@@ -88,8 +92,11 @@ def monitor_process(
     }
 
 
-def _extract_text(obj: dict, parts: list[str]) -> None:
+def _extract_text(obj: object, parts: list[str]) -> None:
     """Extract text content from a stream-json event object."""
+    if not isinstance(obj, dict):
+        return
+
     # claude stream-json format
     msg = obj.get("message") or {}
     content = msg.get("content") or []
@@ -110,9 +117,21 @@ def _extract_text(obj: dict, parts: list[str]) -> None:
     if "output" in obj and isinstance(obj["output"], str):
         parts.append(obj["output"])
 
+    # codex exec --json format: {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
+    item = obj.get("item") or {}
+    if (
+        isinstance(item, dict)
+        and item.get("type") == "agent_message"
+        and isinstance(item.get("text"), str)
+    ):
+        parts.append(item["text"])
 
-def _extract_usage(obj: dict) -> int:
+
+def _extract_usage(obj: object) -> int:
     """Extract total token count from a stream-json event. Returns 0 if absent."""
+    if not isinstance(obj, dict):
+        return 0
+
     usage = obj.get("usage") or {}
     if not isinstance(usage, dict):
         return 0

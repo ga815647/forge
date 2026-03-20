@@ -7,6 +7,7 @@ from typing import Callable
 
 from . import monitor as _monitor
 from .agent_review import auto_review, quick_review
+from .main_config import find_engine_path
 from .security import is_safe_path, safe_write, scan_code, update_manifest
 
 # ── Anti-hallucination / command-confirm injections ───────────────────────────
@@ -69,9 +70,14 @@ def call_cli(
     allowed_tools: list[str] | None = None,
 ) -> subprocess.Popen:
     """Launch CLI subprocess and return Popen object."""
+    cwd = Path(cwd)
+    if not cwd.exists():
+        raise FileNotFoundError(f"Working directory does not exist: {cwd}")
+
     if engine == "claude":
+        executable = _resolve_engine_executable(engine)
         cmd = [
-            "claude",
+            executable,
             "-p",
             prompt,
             "--model",
@@ -83,9 +89,22 @@ def call_cli(
         if allowed_tools:
             cmd += ["--allowedTools", ",".join(allowed_tools)]
     elif engine == "codex":
-        cmd = ["codex", "-q", prompt, "--json"]
-        if allowed_tools:
-            cmd += ["--tools", ",".join(allowed_tools)]
+        executable = _resolve_engine_executable(engine)
+        cmd = [
+            executable,
+            "-a",
+            "never",
+            "exec",
+            "--sandbox",
+            "workspace-write" if allowed_tools else "read-only",
+            "--json",
+        ]
+        if not _is_git_repo(cwd):
+            cmd.append("--skip-git-repo-check")
+        codex_model = _resolve_codex_model(model)
+        if codex_model:
+            cmd += ["-m", codex_model]
+        cmd.append(prompt)
     else:
         raise ValueError(f"Unknown engine: {engine!r}")
 
@@ -93,11 +112,39 @@ def call_cli(
         cmd,
         cwd=str(cwd),
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
         encoding="utf-8",
         errors="replace",
     )
+
+
+def _resolve_codex_model(model: str) -> str | None:
+    """Map Forge's generic model labels to Codex CLI behavior."""
+    if model in {"sonnet", "opus"}:
+        return None
+    return model
+
+
+def _resolve_engine_executable(engine: str) -> str:
+    """Resolve the CLI executable path from shared engine discovery."""
+    path = find_engine_path(engine)
+    if path:
+        return path
+
+    searched = ", ".join([engine, f"{engine}.exe", f"{engine}.cmd"])
+    raise FileNotFoundError(
+        f"Could not find the {engine} CLI executable. Searched: {searched}"
+    )
+
+
+def _is_git_repo(path: Path) -> bool:
+    """Return True when the working directory is inside a Git repository."""
+    current = path.resolve()
+    for candidate in [current, *current.parents]:
+        if (candidate / ".git").exists():
+            return True
+    return False
 
 
 # ── Core functions ────────────────────────────────────────────────────────────

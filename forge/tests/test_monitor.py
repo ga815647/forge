@@ -2,18 +2,12 @@
 import io
 import json
 import subprocess
-from unittest.mock import MagicMock, patch
-
-import pytest
+from unittest.mock import MagicMock
 
 from forge.monitor import _extract_text, _extract_usage, kill_proc_tree, monitor_process
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-
 def _make_process(lines: list[str]) -> MagicMock:
-    """Build a mock Popen whose stdout yields the given lines."""
     proc = MagicMock(spec=subprocess.Popen)
     proc.stdout = io.StringIO("\n".join(lines) + "\n")
     proc.returncode = 0
@@ -30,13 +24,9 @@ def _stream_line(text: str = "", input_tokens: int = 0, output_tokens: int = 0) 
     return json.dumps(obj)
 
 
-# ── _extract_text ─────────────────────────────────────────────────────────────
-
-
 def test_extract_text_claude_format():
     parts: list[str] = []
-    obj = {"message": {"content": [{"type": "text", "text": "hello"}]}}
-    _extract_text(obj, parts)
+    _extract_text({"message": {"content": [{"type": "text", "text": "hello"}]}}, parts)
     assert parts == ["hello"]
 
 
@@ -52,25 +42,32 @@ def test_extract_text_codex_output():
     assert parts == ["codex result"]
 
 
+def test_extract_text_codex_exec_agent_message():
+    parts: list[str] = []
+    _extract_text({"item": {"type": "agent_message", "text": "done"}}, parts)
+    assert parts == ["done"]
+
+
 def test_extract_text_empty_obj():
     parts: list[str] = []
     _extract_text({}, parts)
     assert parts == []
 
 
-def test_extract_text_non_text_block():
+def test_extract_text_non_dict_is_ignored():
     parts: list[str] = []
-    obj = {"message": {"content": [{"type": "tool_use", "id": "x"}]}}
-    _extract_text(obj, parts)
+    _extract_text(123, parts)
     assert parts == []
 
 
-# ── _extract_usage ────────────────────────────────────────────────────────────
+def test_extract_text_non_text_block():
+    parts: list[str] = []
+    _extract_text({"message": {"content": [{"type": "tool_use", "id": "x"}]}}, parts)
+    assert parts == []
 
 
 def test_extract_usage_sums_input_output():
-    obj = {"usage": {"input_tokens": 100, "output_tokens": 50}}
-    assert _extract_usage(obj) == 150
+    assert _extract_usage({"usage": {"input_tokens": 100, "output_tokens": 50}}) == 150
 
 
 def test_extract_usage_missing_returns_zero():
@@ -85,17 +82,17 @@ def test_extract_usage_non_dict_usage():
     assert _extract_usage({"usage": "bad"}) == 0
 
 
-# ── monitor_process ───────────────────────────────────────────────────────────
+def test_extract_usage_non_dict_obj():
+    assert _extract_usage(123) == 0
 
 
 def test_monitor_normal_completion():
-    lines = [_stream_line("hello", 10, 5)]
-    proc = _make_process(lines)
+    proc = _make_process([_stream_line("hello", 10, 5)])
     warned = []
     killed = []
-
     result = monitor_process(
-        proc, max_tokens=1000,
+        proc,
+        max_tokens=1000,
         on_warning=lambda: warned.append(1),
         on_kill=lambda: killed.append(1),
     )
@@ -106,26 +103,24 @@ def test_monitor_normal_completion():
     assert killed == []
 
 
-def test_monitor_85_percent_warning():
-    lines = [_stream_line("x", 850, 0)]
-    proc = _make_process(lines)
+def test_monitor_warning_threshold():
+    proc = _make_process([_stream_line("x", 850, 0)])
     warned = []
-
     monitor_process(
-        proc, max_tokens=1000,
+        proc,
+        max_tokens=1000,
         on_warning=lambda: warned.append(1),
         on_kill=lambda: None,
     )
     assert warned == [1]
 
 
-def test_monitor_95_percent_kill():
-    lines = [_stream_line("x", 950, 0)]
-    proc = _make_process(lines)
+def test_monitor_kill_threshold():
+    proc = _make_process([_stream_line("x", 950, 0)])
     killed = []
-
     result = monitor_process(
-        proc, max_tokens=1000,
+        proc,
+        max_tokens=1000,
         on_warning=lambda: None,
         on_kill=lambda: killed.append(1),
     )
@@ -134,23 +129,37 @@ def test_monitor_95_percent_kill():
 
 
 def test_monitor_skips_invalid_json():
-    lines = ["not json at all", _stream_line("ok", 5, 0)]
-    proc = _make_process(lines)
+    proc = _make_process(["not json at all", _stream_line("ok", 5, 0)])
     result = monitor_process(
-        proc, max_tokens=1000,
+        proc,
+        max_tokens=1000,
         on_warning=lambda: None,
         on_kill=lambda: None,
     )
     assert result["status"] == "completed"
+    assert "not json at all" in result["output"]
+    assert "ok" in result["output"]
+
+
+def test_monitor_tolerates_scalar_json_lines():
+    proc = _make_process(["123", _stream_line("ok", 5, 0)])
+    result = monitor_process(
+        proc,
+        max_tokens=1000,
+        on_warning=lambda: None,
+        on_kill=lambda: None,
+    )
+    assert result["status"] == "completed"
+    assert "123" in result["output"]
     assert "ok" in result["output"]
 
 
 def test_monitor_nonzero_exit_is_truncated():
-    lines = [_stream_line("x", 1, 0)]
-    proc = _make_process(lines)
+    proc = _make_process([_stream_line("x", 1, 0)])
     proc.returncode = 1
     result = monitor_process(
-        proc, max_tokens=1000,
+        proc,
+        max_tokens=1000,
         on_warning=lambda: None,
         on_kill=lambda: None,
     )
@@ -158,10 +167,10 @@ def test_monitor_nonzero_exit_is_truncated():
 
 
 def test_monitor_accumulates_text():
-    lines = [_stream_line("part1", 1, 0), _stream_line("part2", 2, 0)]
-    proc = _make_process(lines)
+    proc = _make_process([_stream_line("part1", 1, 0), _stream_line("part2", 2, 0)])
     result = monitor_process(
-        proc, max_tokens=1000,
+        proc,
+        max_tokens=1000,
         on_warning=lambda: None,
         on_kill=lambda: None,
     )
@@ -169,9 +178,5 @@ def test_monitor_accumulates_text():
     assert "part2" in result["output"]
 
 
-# ── kill_proc_tree ────────────────────────────────────────────────────────────
-
-
 def test_kill_proc_tree_no_crash_on_invalid_pid():
-    """kill_proc_tree with a dead PID should not raise."""
-    kill_proc_tree(999999999)  # almost certainly not a real process
+    kill_proc_tree(999999999)

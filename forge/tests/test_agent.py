@@ -50,7 +50,7 @@ def test_build_context_normalizes_line_endings(tmp_path):
 
 
 def test_call_cli_claude_command(tmp_path):
-    with patch("subprocess.Popen") as mock_popen:
+    with patch("forge.agent._resolve_engine_executable", return_value="claude"), patch("subprocess.Popen") as mock_popen:
         mock_popen.return_value = MagicMock()
         call_cli("test prompt", "claude", tmp_path, "sonnet")
         cmd = mock_popen.call_args[0][0]
@@ -62,7 +62,7 @@ def test_call_cli_claude_command(tmp_path):
 
 
 def test_call_cli_claude_with_model(tmp_path):
-    with patch("subprocess.Popen") as mock_popen:
+    with patch("forge.agent._resolve_engine_executable", return_value="claude"), patch("subprocess.Popen") as mock_popen:
         mock_popen.return_value = MagicMock()
         call_cli("p", "claude", tmp_path, "opus")
         cmd = mock_popen.call_args[0][0]
@@ -72,7 +72,7 @@ def test_call_cli_claude_with_model(tmp_path):
 
 
 def test_call_cli_claude_allowed_tools(tmp_path):
-    with patch("subprocess.Popen") as mock_popen:
+    with patch("forge.agent._resolve_engine_executable", return_value="claude"), patch("subprocess.Popen") as mock_popen:
         mock_popen.return_value = MagicMock()
         call_cli("p", "claude", tmp_path, "sonnet", allowed_tools=["Read", "Write"])
         cmd = mock_popen.call_args[0][0]
@@ -87,9 +87,72 @@ def test_call_cli_codex_command(tmp_path):
         mock_popen.return_value = MagicMock()
         call_cli("test", "codex", tmp_path, "any")
         cmd = mock_popen.call_args[0][0]
-        assert cmd[0] == "codex"
-        assert "-q" in cmd
+        assert Path(cmd[0]).name.lower() == "codex.exe"
+        assert "exec" in cmd
+        assert "-a" in cmd
+        assert "never" in cmd
+        assert "--sandbox" in cmd
+        idx = cmd.index("--sandbox")
+        assert cmd[idx + 1] == "read-only"
         assert "--json" in cmd
+
+
+def test_call_cli_codex_write_mode_uses_workspace_write(tmp_path):
+    with patch("subprocess.Popen") as mock_popen:
+        mock_popen.return_value = MagicMock()
+        call_cli("test", "codex", tmp_path, "any", allowed_tools=["Read", "Write"])
+        cmd = mock_popen.call_args[0][0]
+        idx = cmd.index("--sandbox")
+        assert cmd[idx + 1] == "workspace-write"
+
+
+def test_call_cli_codex_adds_skip_git_check_outside_repo(tmp_path):
+    with patch("subprocess.Popen") as mock_popen:
+        mock_popen.return_value = MagicMock()
+        call_cli("test", "codex", tmp_path, "any")
+        cmd = mock_popen.call_args[0][0]
+        assert "--skip-git-repo-check" in cmd
+
+
+def test_call_cli_codex_skips_flag_inside_repo(tmp_path):
+    with patch("subprocess.Popen") as mock_popen:
+        mock_popen.return_value = MagicMock()
+        (tmp_path / ".git").mkdir()
+        call_cli("test", "codex", tmp_path, "any")
+        cmd = mock_popen.call_args[0][0]
+        assert "--skip-git-repo-check" not in cmd
+
+
+def test_call_cli_codex_omits_forge_placeholder_model(tmp_path):
+    with patch("subprocess.Popen") as mock_popen:
+        mock_popen.return_value = MagicMock()
+        call_cli("test", "codex", tmp_path, "sonnet")
+        cmd = mock_popen.call_args[0][0]
+        assert "-m" not in cmd
+
+
+def test_call_cli_codex_passes_explicit_model(tmp_path):
+    with patch("subprocess.Popen") as mock_popen:
+        mock_popen.return_value = MagicMock()
+        call_cli("test", "codex", tmp_path, "gpt-5.4")
+        cmd = mock_popen.call_args[0][0]
+        assert "-m" in cmd
+        idx = cmd.index("-m")
+        assert cmd[idx + 1] == "gpt-5.4"
+
+
+def test_call_cli_uses_configured_codex_path(tmp_path):
+    with patch("forge.agent.find_engine_path", return_value=str(tmp_path / "codex.exe")), patch("subprocess.Popen") as mock_popen:
+        mock_popen.return_value = MagicMock()
+        call_cli("test", "codex", tmp_path, "sonnet")
+        cmd = mock_popen.call_args[0][0]
+        assert cmd[0] == str(tmp_path / "codex.exe")
+
+
+def test_call_cli_missing_executable_raises_clear_error(tmp_path):
+    with patch("forge.agent.find_engine_path", return_value=None):
+        with pytest.raises(FileNotFoundError, match="Could not find the codex CLI executable"):
+            call_cli("test", "codex", tmp_path, "sonnet")
 
 
 def test_call_cli_unknown_engine_raises(tmp_path):

@@ -1,13 +1,15 @@
 """main.py - Forge Gradio UI entry point."""
 from __future__ import annotations
 
+import queue
 import threading
+import time
+import traceback
 from pathlib import Path
 from typing import Generator
 
 
-
-# ── Session state ─────────────────────────────────────────────────────────────
+_LOG_POLL_INTERVAL = 0.2
 
 
 class _Session:
@@ -21,17 +23,19 @@ class _Session:
 
     def _init_tracker(self) -> None:
         from .orchestrator_main import CostTracker
+
         self.cost_tracker = CostTracker()
 
     def _init_approved(self) -> None:
         from .security import ApprovedPaths
+
         self.approved: ApprovedPaths = ApprovedPaths()
 
     def next_round(self) -> int:
         with self._lock:
-            r = self.round_num
+            round_num = self.round_num
             self.round_num += 1
-            return r
+            return round_num
 
     def reset(self) -> None:
         with self._lock:
@@ -45,11 +49,12 @@ _session = _Session()
 
 
 def create_session_state() -> dict:
-    """建立新的 session 狀態字典（供 Gradio state 使用）。"""
+    """Create a fresh Gradio-friendly session state object."""
     from .security import ApprovedPaths
+
     return {
         "approved": ApprovedPaths(),
-        "guard": None,  # 在 project_path 確定後初始化
+        "guard": None,
     }
 
 
@@ -60,19 +65,67 @@ def update_progress(
     tokens: int,
     max_tokens: int,
 ) -> tuple[str, object]:
-    """由 SessionGuard 的 ui_update_callback 呼叫，更新進度顯示。"""
+    """Render coarse session progress for optional UI callbacks."""
     pct = turns / max_turns if max_turns else 0
-    progress_text = f"輪數：{turns} / {max_turns}　Token：{tokens:,} / {max_tokens:,}"
+    progress_text = f"Turns: {turns} / {max_turns} | Tokens: {tokens:,} / {max_tokens:,}"
     near_limit = pct >= 0.8
-    warning_text = f"⚠️ 已達 {pct:.0%}，接近上限。如需繼續請在 purpose.md 調高 max_turns。"
+    warning_text = (
+        f"Warning: session is at {pct:.0%} of the configured turn budget. "
+        "Review purpose.md if you need to raise the limit."
+    )
     try:
         import gradio as gr
+
         return progress_text, gr.update(value=warning_text, visible=near_limit)
     except ImportError:
         return progress_text, {"value": warning_text, "visible": near_limit}
 
 
-# ── Chat handler ──────────────────────────────────────────────────────────────
+def _format_live_log(log_lines: list[str]) -> str:
+    """Render the dedicated live log panel."""
+    if not log_lines:
+        return "Waiting for backend log..."
+    return "\n".join(log_lines)
+
+
+def _format_response(status: str, output: str, log_lines: list[str], running: bool) -> str:
+    """Render the assistant bubble with status and current backend log."""
+    parts = [f"**Status**: {status}"]
+
+    if output.strip():
+        parts.extend(["", output.strip()])
+    elif running:
+        parts.extend(["", "Running. Backend log will appear below as soon as work starts."])
+
+    parts.extend(
+        [
+            "",
+            "<details open><summary>Live Log</summary>",
+            "",
+            "```text",
+            _format_live_log(log_lines),
+            "```",
+            "</details>",
+        ]
+    )
+    return "\n".join(parts)
+
+
+def _snapshot_history(history: list) -> list:
+    """Return a shallow copy safe for incremental UI yields."""
+    return [dict(item) if isinstance(item, dict) else item for item in history]
+
+
+def _ensure_session_guard(project_path: Path) -> None:
+    if _session.session_guard is not None:
+        return
+
+    from .security import SessionGuard
+
+    _session.session_guard = SessionGuard.from_purpose(
+        project_path,
+        ui_max_turns=None,
+    )
 
 
 def chat(
@@ -82,80 +135,126 @@ def chat(
     engine: str,
     mode: str,
     review_mode: bool,
-) -> Generator[list, None, None]:
+) -> Generator[tuple[list, str], None, None]:
+    """Stream chat updates and live backend logs into the UI."""
     from .orchestrator_main import handle_input
 
+    history = list(history or [])
     if not message.strip():
-        yield history
+        yield history, ""
         return
 
     project_path = Path(project_path_str.strip()) if project_path_str.strip() else Path(".")
     if not project_path.exists():
         yield history + [
             {"role": "user", "content": message},
-            {"role": "assistant", "content": f"路徑不存在: {project_path}"},
-        ]
+            {"role": "assistant", "content": f"Project path does not exist: {project_path}"},
+        ], ""
         return
 
     _session.project_path = project_path
-    if _session.session_guard is None:
-        from .security import SessionGuard
-        _session.session_guard = SessionGuard.from_purpose(
-            project_path,
-            ui_max_turns=None,  # 之後可從 UI 輸入框取值
-        )
+    _ensure_session_guard(project_path)
+
     log_lines: list[str] = []
-    history = history + [{"role": "user", "content": message},
-                         {"role": "assistant", "content": "⏳ 處理中..."}]
-    yield history
+    history = history + [
+        {"role": "user", "content": message},
+        {"role": "assistant", "content": _format_response("running", "", log_lines, running=True)},
+    ]
+    yield _snapshot_history(history), _format_live_log(log_lines)
 
     round_num = _session.next_round()
-    result = handle_input(
-        user_input=message,
-        uploaded_files=[],
-        mode=mode,
-        project_path=project_path,
-        engine=engine,
-        on_log=lambda msg: log_lines.append(msg),
-        review_mode=review_mode,
-        round_num=round_num,
-        cost_tracker=_session.cost_tracker,
-        session_guard=_session.session_guard,
-        approved_paths=_session.approved,
-    )
+    log_queue: queue.Queue[str] = queue.Queue()
+    result_holder: dict[str, dict] = {}
+    error_holder: dict[str, str] = {}
 
-    status = result.get("status", "done")
-    output = result.get("output", "")
-    log_text = "\n".join(log_lines)
-    response = f"**狀態**: {status}\n\n{output}"
-    if log_text:
-        response += f"\n\n<details><summary>Log</summary>\n\n```\n{log_text}\n```\n</details>"
+    def _worker() -> None:
+        try:
+            result_holder["result"] = handle_input(
+                user_input=message,
+                uploaded_files=[],
+                mode=mode,
+                project_path=project_path,
+                engine=engine,
+                on_log=log_queue.put,
+                review_mode=review_mode,
+                round_num=round_num,
+                cost_tracker=_session.cost_tracker,
+                session_guard=_session.session_guard,
+                approved_paths=_session.approved,
+            )
+        except Exception:
+            error_holder["traceback"] = traceback.format_exc()
 
-    history[-1] = {"role": "assistant", "content": response}
-    yield history
+    worker = threading.Thread(target=_worker, daemon=True)
+    worker.start()
 
+    while worker.is_alive() or not log_queue.empty():
+        updated = False
 
-# ── Action handlers ───────────────────────────────────────────────────────────
+        while True:
+            try:
+                log_lines.append(log_queue.get_nowait())
+                updated = True
+            except queue.Empty:
+                break
+
+        if updated:
+            history[-1] = {
+                "role": "assistant",
+                "content": _format_response("running", "", log_lines, running=True),
+            }
+            yield _snapshot_history(history), _format_live_log(log_lines)
+
+        if worker.is_alive():
+            time.sleep(_LOG_POLL_INTERVAL)
+
+    worker.join()
+
+    while not log_queue.empty():
+        log_lines.append(log_queue.get_nowait())
+
+    if "traceback" in error_holder:
+        log_lines.append("Unhandled exception")
+        log_lines.append(error_holder["traceback"].rstrip())
+        status = "error"
+        output = "Backend execution failed. See Live Log for the traceback."
+    else:
+        result = result_holder.get("result", {})
+        status = result.get("status", "done")
+        output = result.get("output", "")
+
+    history[-1] = {
+        "role": "assistant",
+        "content": _format_response(status, output, log_lines, running=False),
+    }
+    yield _snapshot_history(history), _format_live_log(log_lines)
 
 
 def stop_forge() -> str:
     from .orchestrator_main import force_stop
+
     force_stop()
-    return "已停止"
+    return "Stopped."
 
 
 def rollback_ui(project_path_str: str, target_hash: str) -> str:
     from .git_ops import rollback
     from .orchestrator_main import force_stop
-    ok = rollback(Path(project_path_str.strip()), target_hash.strip(), force_stop_fn=force_stop)
-    return "✅ 回滾成功" if ok else "❌ 回滾失敗"
+
+    ok = rollback(
+        Path(project_path_str.strip()),
+        target_hash.strip(),
+        force_stop_fn=force_stop,
+    )
+    return "Rollback completed." if ok else "Rollback failed."
 
 
 def list_commits_ui(project_path_str: str) -> str:
     from .git_ops import list_commits
+
     commits = list_commits(Path(project_path_str.strip()), max_count=15)
     if not commits:
-        return "無 commit 記錄（git 未初始化或無 commit）"
+        return "No commits found."
     return "\n".join(f"`{c['hash'][:8]}` {c['msg']}" for c in commits)
 
 
@@ -163,11 +262,9 @@ def cost_summary() -> str:
     return _session.cost_tracker.summary()
 
 
-# ── Launch ────────────────────────────────────────────────────────────────────
-
-
 def launch(share: bool = False) -> None:
     from .ui_builder import build_combined_ui
+
     ui = build_combined_ui(chat, stop_forge, rollback_ui, list_commits_ui, cost_summary)
     ui.launch(share=share)
 
