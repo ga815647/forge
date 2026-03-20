@@ -1,7 +1,54 @@
 """ui_builder.py - Gradio UI layout builders for Forge."""
 from __future__ import annotations
 
+from pathlib import Path
+
 from .main_config import detect_engines, load_config, save_config
+
+
+def _default_project_path() -> str:
+    return str(Path.cwd())
+
+
+def _resolve_initial_directory(current_path: str) -> str:
+    raw_path = (current_path or "").strip()
+    candidate = Path(raw_path) if raw_path else Path.cwd()
+
+    if candidate.exists():
+        return str(candidate if candidate.is_dir() else candidate.parent)
+    if candidate.parent.exists():
+        return str(candidate.parent)
+    return str(Path.cwd())
+
+
+def _open_directory_dialog(initial_dir: str) -> str:
+    import tkinter as tk
+    from tkinter import filedialog
+
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+
+    try:
+        return filedialog.askdirectory(
+            initialdir=initial_dir,
+            mustexist=True,
+            title="Select Project Directory",
+        )
+    finally:
+        root.destroy()
+
+
+def _pick_directory(current_path: str) -> str:
+    current_value = (current_path or "").strip()
+    try:
+        selected = _open_directory_dialog(_resolve_initial_directory(current_value))
+    except Exception:
+        return current_value
+    return selected or current_value
 
 
 def build_combined_ui(chat_fn, stop_fn, rollback_fn, commits_fn, cost_summary_fn):
@@ -45,8 +92,10 @@ def build_combined_ui(chat_fn, stop_fn, rollback_fn, commits_fn, cost_summary_fn
             project_path_box = gr.Textbox(
                 label="Project Path",
                 placeholder="e.g. C:/Users/me/myproject",
-                scale=4,
+                value=_default_project_path,
+                scale=5,
             )
+            project_path_btn = gr.Button("Browse...", scale=1, min_width=110)
             engine_dd = gr.Dropdown(engine_choices, value=default_engine, label="Engine", scale=2)
             mode_dd = gr.Dropdown(
                 ["forge", "direct"],
@@ -140,6 +189,14 @@ def build_combined_ui(chat_fn, stop_fn, rollback_fn, commits_fn, cost_summary_fn
             _toggle,
             inputs=settings_visible_state,
             outputs=[settings_col, settings_visible_state],
+        )
+
+        project_path_btn.click(
+            _pick_directory,
+            inputs=[project_path_box],
+            outputs=[project_path_box],
+            queue=False,
+            show_progress="hidden",
         )
 
         def do_save(eng, mode, review, warn, kill):
@@ -314,8 +371,10 @@ def build_main_ui(cfg: dict, chat_fn, stop_fn, rollback_fn, commits_fn, cost_sum
             project_path_box = gr.Textbox(
                 label="Project Path",
                 placeholder="e.g. C:/Users/me/myproject",
-                scale=4,
+                value=_default_project_path,
+                scale=5,
             )
+            project_path_btn = gr.Button("Browse...", scale=1, min_width=110)
 
         with gr.Row():
             engine_dd = gr.Dropdown(engine_choices, value=default_engine, label="Engine", scale=2)
@@ -352,6 +411,14 @@ def build_main_ui(cfg: dict, chat_fn, stop_fn, rollback_fn, commits_fn, cost_sum
             gen = chat_fn(message, history, path, engine, mode, review)
             for updated_history, live_log in gen:
                 yield updated_history, cost_summary_fn(), "", live_log
+
+        project_path_btn.click(
+            _pick_directory,
+            inputs=[project_path_box],
+            outputs=[project_path_box],
+            queue=False,
+            show_progress="hidden",
+        )
 
         submit_btn.click(
             submit,
