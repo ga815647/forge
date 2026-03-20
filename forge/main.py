@@ -5,8 +5,6 @@ import threading
 from pathlib import Path
 from typing import Generator
 
-from .main_config import load_config
-from .ui_builder import build_main_ui, build_setup_ui
 
 
 # ── Session state ─────────────────────────────────────────────────────────────
@@ -16,12 +14,18 @@ class _Session:
     def __init__(self) -> None:
         self.round_num = 1
         self.project_path: Path | None = None
+        self.session_guard = None
         self._lock = threading.Lock()
         self._init_tracker()
+        self._init_approved()
 
     def _init_tracker(self) -> None:
         from .orchestrator_main import CostTracker
         self.cost_tracker = CostTracker()
+
+    def _init_approved(self) -> None:
+        from .security import ApprovedPaths
+        self.approved: ApprovedPaths = ApprovedPaths()
 
     def next_round(self) -> int:
         with self._lock:
@@ -32,10 +36,40 @@ class _Session:
     def reset(self) -> None:
         with self._lock:
             self.round_num = 1
+            self.session_guard = None
             self._init_tracker()
+            self._init_approved()
 
 
 _session = _Session()
+
+
+def create_session_state() -> dict:
+    """建立新的 session 狀態字典（供 Gradio state 使用）。"""
+    from .security import ApprovedPaths
+    return {
+        "approved": ApprovedPaths(),
+        "guard": None,  # 在 project_path 確定後初始化
+    }
+
+
+def update_progress(
+    state: dict,
+    turns: int,
+    max_turns: int,
+    tokens: int,
+    max_tokens: int,
+) -> tuple[str, object]:
+    """由 SessionGuard 的 ui_update_callback 呼叫，更新進度顯示。"""
+    pct = turns / max_turns if max_turns else 0
+    progress_text = f"輪數：{turns} / {max_turns}　Token：{tokens:,} / {max_tokens:,}"
+    near_limit = pct >= 0.8
+    warning_text = f"⚠️ 已達 {pct:.0%}，接近上限。如需繼續請在 purpose.md 調高 max_turns。"
+    try:
+        import gradio as gr
+        return progress_text, gr.update(value=warning_text, visible=near_limit)
+    except ImportError:
+        return progress_text, {"value": warning_text, "visible": near_limit}
 
 
 # ── Chat handler ──────────────────────────────────────────────────────────────
@@ -64,6 +98,12 @@ def chat(
         return
 
     _session.project_path = project_path
+    if _session.session_guard is None:
+        from .security import SessionGuard
+        _session.session_guard = SessionGuard.from_purpose(
+            project_path,
+            ui_max_turns=None,  # 之後可從 UI 輸入框取值
+        )
     log_lines: list[str] = []
     history = history + [{"role": "user", "content": message},
                          {"role": "assistant", "content": "⏳ 處理中..."}]
@@ -80,6 +120,8 @@ def chat(
         review_mode=review_mode,
         round_num=round_num,
         cost_tracker=_session.cost_tracker,
+        session_guard=_session.session_guard,
+        approved_paths=_session.approved,
     )
 
     status = result.get("status", "done")
@@ -125,11 +167,8 @@ def cost_summary() -> str:
 
 
 def launch(share: bool = False) -> None:
-    cfg = load_config()
-    if cfg is None:
-        ui = build_setup_ui()
-    else:
-        ui = build_main_ui(cfg, chat, stop_forge, rollback_ui, list_commits_ui, cost_summary)
+    from .ui_builder import build_combined_ui
+    ui = build_combined_ui(chat, stop_forge, rollback_ui, list_commits_ui, cost_summary)
     ui.launch(share=share)
 
 
