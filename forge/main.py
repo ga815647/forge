@@ -20,6 +20,12 @@ class _Session:
         self.pending_review: bool = False
         self.pending_clarification: bool = False
         self.pending_input: str = ""
+        self.pending_confirm: bool = False
+        self.pending_confirm_input: str = ""
+        self.pending_path_confirm: bool = False
+        self.pending_path_confirm_files: list = []
+        self.pending_external_files: list = []
+        self.pending_existing_agent: bool = False
         self._lock = threading.Lock()
         self._init_tracker()
         self._init_approved()
@@ -47,6 +53,12 @@ class _Session:
             self.pending_review = False
             self.pending_clarification = False
             self.pending_input = ""
+            self.pending_confirm = False
+            self.pending_confirm_input = ""
+            self.pending_path_confirm = False
+            self.pending_path_confirm_files = []
+            self.pending_external_files = []
+            self.pending_existing_agent = False
             self._init_tracker()
             self._init_approved()
 
@@ -100,7 +112,7 @@ def _format_response(status: str, output: str, log_lines: list[str], running: bo
     Blocking statuses (needs_clarification, needs_review) get a distinct
     visual treatment to ensure the user notices they must reply.
     """
-    BLOCKING_STATUSES = ("needs_clarification", "needs_review")
+    BLOCKING_STATUSES = ("needs_clarification", "needs_review", "needs_confirm")
 
     if status in BLOCKING_STATUSES and output.strip():
         # Blocking bubble: output is the whole content, no status prefix, no log
@@ -188,6 +200,17 @@ def chat(
     result_holder: dict[str, dict] = {}
     error_holder: dict[str, str] = {}
 
+    from .main_config import load_config
+    _cfg = load_config() or {}
+    _warn_pct = _cfg.get("token_warning_pct", 85) / 100.0
+    _kill_pct = _cfg.get("token_kill_pct", 95) / 100.0
+
+    def _on_token_warning() -> None:
+        log_queue.put(f"⚠️ Token 用量已超過警告門檻（{int(_warn_pct * 100)}%），請注意 session 剩餘額度。")
+
+    def _on_token_kill() -> None:
+        log_queue.put(f"🔴 Token 用量已達強制停止門檻（{int(_kill_pct * 100)}%），本輪將提前結束。")
+
     def _worker() -> None:
         try:
             result_holder["result"] = handle_input(
@@ -202,9 +225,25 @@ def chat(
                 cost_tracker=_session.cost_tracker,
                 session_guard=_session.session_guard,
                 approved_paths=_session.approved,
+                on_token_warning=_on_token_warning,
+                on_token_kill=_on_token_kill,
             )
-        except Exception:
-            error_holder["traceback"] = traceback.format_exc()
+        except Exception as _exc:
+            from .security import SessionLimitExceeded
+            if isinstance(_exc, SessionLimitExceeded):
+                result_holder["result"] = {
+                    "status": "needs_clarification",
+                    "output": (
+                        f"⚠️ {_exc}\n\n"
+                        "請選擇：\n"
+                        "- **繼續** — 在 `.agent/purpose.md` 調高 `max_turns` 後輸入繼續\n"
+                        "- **終止** — 結束本次任務"
+                    ),
+                    "round": round_num,
+                }
+                _session.pending_clarification = True
+            else:
+                error_holder["traceback"] = traceback.format_exc()
 
     worker = threading.Thread(target=_worker, daemon=True)
     worker.start()

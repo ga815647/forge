@@ -138,6 +138,17 @@ def parse_review_reply(user_input: str) -> str:
     return "continue"
 
 
+def parse_confirm_reply(user_input: str) -> str:
+    """解析 needs_confirm 後的使用者回覆。
+    回傳 'yes' | 'no'
+    """
+    stripped = user_input.strip().lower()
+    YES_WORDS = {"yes", "y", "確認", "繼續", "執行", "ok", "confirm", "proceed"}
+    if stripped in YES_WORDS:
+        return "yes"
+    return "no"
+
+
 def safety_check(user_input: str) -> str | None:
     """Return warning message if user_input contains dangerous patterns, else None."""
     match = _DANGEROUS_RE.search(user_input)
@@ -208,6 +219,8 @@ def handle_input(
     cost_tracker: CostTracker | None = None,
     session_guard: SessionGuard | None = None,
     approved_paths: ApprovedPaths | None = None,
+    on_token_warning: Callable[[], None] | None = None,
+    on_token_kill: Callable[[], None] | None = None,
 ) -> dict:
     """Route user input to direct mode or Forge mode.
 
@@ -234,16 +247,56 @@ def handle_input(
         log("Blocked request because prompt injection patterns were detected")
         return {
             "status": "blocked",
-            "output": "⚠️ 偵測到可能的 prompt injection 攻擊，已阻止執行。",
+            "output": (
+                "⚠️ 偵測到可能的 prompt injection 攻擊，已阻止執行。\n\n"
+                "**如果你不是在描述攻擊，而是有正當的技術需求：**\n"
+                "- 把指令放進引號，例如：「分析以下程式碼：`rm -rf /`」\n"
+                "- 改用描述性語句：「說明這個指令的風險：…」\n"
+                "- 前綴說明情境：「假設我需要處理一個包含以下字串的輸入：…」"
+            ),
             "round": round_num,
         }
 
     # ── Direct execution mode ─────────────────────────────────────────────
     if mode == "direct":
         log("Routing to direct execution mode")
+
+        # ── Pending confirm reply handling ────────────────────────────────
+        from . import main as _main_module
+        _sess_d = getattr(_main_module, "_session", None)
+        if _sess_d is not None and getattr(_sess_d, "pending_confirm", False):
+            _sess_d.pending_confirm = False
+            reply = parse_confirm_reply(user_input)
+            log(f"Confirm reply parsed: {reply}")
+            if reply == "no":
+                _sess_d.pending_confirm_input = ""
+                return {
+                    "status": "blocked",
+                    "output": "已取消。",
+                    "round": round_num,
+                }
+            # yes: re-execute the stored dangerous command
+            original_input = _sess_d.pending_confirm_input
+            _sess_d.pending_confirm_input = ""
+            log(f"User confirmed; executing original command: {summarize_text(original_input, 80)}")
+            output = _agent.do(
+                original_input,
+                context_files=[],
+                engine=engine,
+                cwd=project_path,
+                model="opus",
+                on_log=log,
+            )
+            log(f"Confirmed direct execution completed; output_chars={len(output)}")
+            return {"status": "done", "output": output, "round": round_num}
+
         warning = safety_check(user_input)
         if warning:
             log(f"Direct execution paused for confirmation: {summarize_text(warning)}")
+            if _sess_d is not None:
+                _sess_d.pending_confirm = True
+                _sess_d.pending_confirm_input = user_input
+                log("pending_confirm 已設為 True，等待使用者確認")
             return {
                 "status": "needs_confirm",
                 "output": warning,
@@ -309,9 +362,131 @@ def handle_input(
         # Continuation: run one loop round
         log("Found existing Forge state; continuing main loop")
 
-        # ── Clarification reply handling ───────────────────────────────────
         from . import main as _main_module
         _sess = getattr(_main_module, "_session", None)
+
+        # ── Existing agent: ask user on first contact ──────────────────────
+        if _sess is not None and not getattr(_sess, "pending_existing_agent", True):
+            # pending_existing_agent starts as False → we haven't asked yet
+            _sess.pending_existing_agent = True
+            _sess.pending_clarification = True
+            _sess.pending_input = user_input  # store original message
+            log("pending_existing_agent: 首次接觸已有 .agent/，詢問使用者")
+            return {
+                "status": "needs_clarification",
+                "output": (
+                    "## ⚠️ 偵測到上次 Forge 記憶\n\n"
+                    f"專案 `{project_path.name}` 有上次的 Forge session（`.agent/` 目錄已存在）。\n\n"
+                    "---\n請回覆：\n"
+                    "- **繼續** — 繼續上次的任務（你剛輸入的訊息會作為本輪 user message）\n"
+                    "- **重新開始** — 清除上次記憶，以你剛才的輸入重新規劃\n"
+                ),
+                "round": round_num,
+            }
+
+        # ── Existing agent restart reply handling ──────────────────────────
+        if _sess is not None and getattr(_sess, "pending_existing_agent", False) and getattr(_sess, "pending_clarification", False):
+            _sess.pending_existing_agent = False
+            _sess.pending_clarification = False
+            original_input = getattr(_sess, "pending_input", user_input)
+            _sess.pending_input = ""
+            stripped = user_input.strip()
+            RESTART_WORDS = {"重新開始", "重新", "restart", "清除", "reset", "新任務"}
+            if any(w in stripped for w in RESTART_WORDS):
+                import shutil
+                agent_dir_to_delete = project_path / ".agent"
+                try:
+                    shutil.rmtree(str(agent_dir_to_delete))
+                    log("使用者選擇重新開始；.agent/ 已刪除")
+                except OSError as e:
+                    log(f"刪除 .agent/ 失敗: {e}")
+                result = _init.run(
+                    original_input,
+                    uploaded_files,
+                    project_path,
+                    engine,
+                    on_log=on_log,
+                    review_mode=review_mode,
+                )
+                if result.get("needs_clarification"):
+                    _status = "needs_clarification"
+                elif result.get("needs_review"):
+                    _status = "needs_review"
+                else:
+                    _status = "initialized"
+                return {
+                    "status": _status,
+                    "output": result.get("plan", "初始化完成"),
+                    "round": round_num,
+                }
+            else:
+                # 繼續上次：用原始 user_input 繼續
+                log("使用者選擇繼續上次 session")
+                user_input = original_input  # use stored original for the loop
+
+        # ── Path confirmation reply handling ───────────────────────────────
+        _sess = getattr(_main_module, "_session", None)
+        if _sess is not None and getattr(_sess, "pending_path_confirm", False):
+            _sess.pending_path_confirm = False
+            files = getattr(_sess, "pending_path_confirm_files", [])
+            reply = parse_confirm_reply(user_input)
+            log(f"Path confirm reply parsed: {reply}, files={files}")
+            if reply == "no":
+                _sess.pending_path_confirm_files = []
+                import subprocess as _sp
+                for f_rel in files:
+                    try:
+                        _sp.run(
+                            ["git", "checkout", "--", f_rel],
+                            cwd=str(project_path), capture_output=True,
+                        )
+                    except Exception:
+                        pass
+                log(f"Reverted {len(files)} path(s) after user denial")
+                return {
+                    "status": "blocked",
+                    "output": f"已還原修改的敏感路徑：{', '.join(files)}",
+                    "round": round_num,
+                }
+            # yes: approve paths in approved_paths and continue
+            _sess.pending_path_confirm_files = []
+            if approved_paths is not None:
+                for f_rel in files:
+                    approved_paths.approve(project_path / f_rel)
+            log(f"Approved {len(files)} confirm-required path(s)")
+            return {
+                "status": "continue",
+                "output": f"已確認，繼續執行。批准路徑：{', '.join(files)}",
+                "round": round_num,
+            }
+
+        # ── External change reply handling ─────────────────────────────────
+        if _sess is not None and getattr(_sess, "pending_clarification", False) and getattr(_sess, "pending_external_files", []):
+            _sess.pending_clarification = False
+            ext_files = list(_sess.pending_external_files)
+            _sess.pending_external_files = []
+            stripped = user_input.strip()
+            INTEGRATE_WORDS = {"整合", "integrate", "合併", "納入"}
+            REVERT_WORDS = {"還原", "revert", "還原修改", "回復"}
+            IGNORE_WORDS = {"略過", "ignore", "跳過", "繼續"}
+            if any(w in stripped for w in REVERT_WORDS):
+                from .loop_helpers import revert_external
+                revert_external(ext_files, project_path, log)
+                log(f"User chose revert for external files: {ext_files}")
+                return {"status": "continue", "output": "已還原外部修改，繼續執行。", "round": round_num}
+            elif any(w in stripped for w in IGNORE_WORDS):
+                log(f"User chose ignore for external files: {ext_files}")
+                return {"status": "continue", "output": "已略過外部修改，繼續執行。", "round": round_num}
+            else:
+                # Default: integrate
+                from .loop_helpers import integrate_external_changes
+                from .security import SessionGuard
+                agent_dir_tmp = project_path / ".agent"
+                integrate_external_changes(ext_files, project_path, agent_dir_tmp, engine, log)
+                log(f"User chose integrate for external files: {ext_files}")
+                return {"status": "continue", "output": "已整合外部修改，繼續執行。", "round": round_num}
+
+        # ── Clarification reply handling ───────────────────────────────────
         if _sess is not None and getattr(_sess, "pending_clarification", False):
             _sess.pending_clarification = False
             reply = parse_clarification_reply(user_input)
@@ -420,6 +595,9 @@ def handle_input(
             round_num=round_num,
             on_log=on_log,
             review_mode=review_mode,
+            on_token_warning=on_token_warning,
+            on_token_kill=on_token_kill,
+            approved_paths=approved_paths,
         )
         status = result.get("status", "continue")
         log(

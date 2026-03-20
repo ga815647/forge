@@ -11,6 +11,7 @@ from forge.security import (
     ApprovedPaths,
     ScanResult,
     SessionGuard,
+    SessionLimitExceeded,
     atomic_write,
     backup_before_do,
     build_manifest,
@@ -376,7 +377,7 @@ def test_session_guard_raises_on_exceed(tmp_path):
     guard = SessionGuard(max_turns=2)
     guard.check_and_increment()
     guard.check_and_increment()
-    with pytest.raises(RuntimeError, match="最大輪數"):
+    with pytest.raises(SessionLimitExceeded, match="最大輪數"):
         guard.check_and_increment()
 
 

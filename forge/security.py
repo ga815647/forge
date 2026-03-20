@@ -1,6 +1,10 @@
 """security.py - Path safety, manifest validation, prompt injection detection, safe file writes."""
 from __future__ import annotations
 
+
+class SessionLimitExceeded(Exception):
+    """Raised when SessionGuard turn or token limits are exceeded."""
+
 import ast
 import hashlib
 import json
@@ -469,12 +473,12 @@ class SessionGuard:
             )
 
         if self.turns > self.max_turns:
-            raise RuntimeError(
+            raise SessionLimitExceeded(
                 f"Session 超過最大輪數限制（{self.max_turns} 輪）。"
                 f"如需繼續，請在 purpose.md 設定 max_turns: N 後重新啟動。"
             )
         if self.tokens > self.max_tokens:
-            raise RuntimeError(
+            raise SessionLimitExceeded(
                 f"Session token 用量超過 {self.max_tokens:,}，已強制停止。"
             )
 

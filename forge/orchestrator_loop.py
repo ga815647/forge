@@ -25,7 +25,16 @@ from .loop_helpers import (
     save_summary,
     update_upper_files,
 )
-from .security import backup_before_do, is_safe_path, restore_from_backup, safe_write, update_manifest, verify_manifest
+from .security import (
+    ApprovedPaths,
+    backup_before_do,
+    is_project_hardblock,
+    is_safe_path,
+    restore_from_backup,
+    safe_write,
+    update_manifest,
+    verify_manifest,
+)
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
@@ -39,6 +48,7 @@ def run(
     on_token_warning: Callable[[], None] | None = None,
     on_token_kill: Callable[[], None] | None = None,
     review_mode: bool = False,
+    approved_paths: ApprovedPaths | None = None,
 ) -> dict:
     """Execute one round of the main loop.
 
@@ -69,7 +79,30 @@ def run(
     external = detect_external_changes(project_path)
     if external:
         log(f"⚠️ 偵測到外部修改: {', '.join(external)}")
-        choice = ask_integrate_external(external, log)
+        decision = ask_integrate_external(external, log)
+        if isinstance(decision, dict) and decision.get("action") == "ask":
+            # Surface to user via needs_clarification
+            from . import main as _main_module
+            _sess = getattr(_main_module, "_session", None)
+            if _sess is not None:
+                _sess.pending_clarification = True
+                _sess.pending_external_files = list(external)
+            file_list = ", ".join(external)
+            return {
+                "status": "needs_clarification",
+                "round": round_num,
+                "tokens": tokens_used,
+                "summary": (
+                    f"## ⚠️ 偵測到外部修改\n\n"
+                    f"有其他編輯器修改了以下檔案：\n`{file_list}`\n\n"
+                    f"---\n請回覆：\n"
+                    f"- **整合** — 把外部修改納入 Forge 的認識繼續執行\n"
+                    f"- **還原** — 把這些外部修改還原為 Forge 最後的版本\n"
+                    f"- **略過** — 忽略，繼續執行（外部修改保留但不整合）\n"
+                ),
+            }
+        # Legacy string response (shouldn't happen, but keep as fallback)
+        choice = decision if isinstance(decision, str) else "integrate"
         log(f"External change policy selected: {choice}")
         if choice == "integrate":
             integrate_external_changes(external, project_path, agent_dir, engine, log)
@@ -226,6 +259,55 @@ def run(
         restore_from_backup(backup_mapping)
         raise ValueError(f"do() 寫出了專案目錄範圍外：{outside}")
     log("do() write scope verification passed")
+
+    # ── Hard-block path check ─────────────────────────────────────────────
+    hardblocked = [f for f in changed if is_project_hardblock(f, project_path)]
+    if hardblocked:
+        import subprocess as _sp
+        rel_names = [str(f.relative_to(project_path)) for f in hardblocked]
+        log(f"Hard-blocked paths written by do(); reverting: {rel_names}")
+        try:
+            _sp.run(
+                ["git", "checkout", "--"] + [str(f) for f in hardblocked],
+                cwd=str(project_path), capture_output=True,
+            )
+        except Exception:
+            pass
+        from .orchestrator_main import format_hardblock_message
+        return {
+            "status": "blocked",
+            "round": round_num,
+            "tokens": tokens_used,
+            "summary": format_hardblock_message(
+                reason="LLM 試圖寫入永久禁止的路徑",
+                detail=", ".join(rel_names),
+            ),
+        }
+
+    # ── Confirm-required path check ───────────────────────────────────────
+    _approved = approved_paths
+    if _approved is not None:
+        from .orchestrator_main import format_confirm_message, should_confirm_path
+        confirm_needed = [f for f in changed if should_confirm_path(f, project_path, _approved)]
+        if confirm_needed:
+            rel_names = [str(f.relative_to(project_path)) for f in confirm_needed]
+            log(f"Confirm-required paths modified by do(): {rel_names}")
+            from . import main as _main_module
+            _sess = getattr(_main_module, "_session", None)
+            if _sess is not None:
+                _sess.pending_path_confirm = True
+                _sess.pending_path_confirm_files = rel_names
+                log("pending_path_confirm 已設為 True")
+            return {
+                "status": "needs_confirm",
+                "round": round_num,
+                "tokens": tokens_used,
+                "summary": format_confirm_message(
+                    reason="LLM 修改了需要你確認的敏感路徑",
+                    detail=", ".join(rel_names),
+                    rule="project confirm-required paths",
+                ),
+            }
 
     summary_path = (
         agent_dir / "lower" / "summaries" / f"round_{round_num:03d}.md"

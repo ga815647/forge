@@ -53,13 +53,18 @@ def detect_external_changes(project_path: Path) -> list[str]:
         return []
 
 
-def ask_integrate_external(files: list[str], log: Callable) -> str:
+def ask_integrate_external(files: list[str], log: Callable) -> dict:
+    """Return a sentinel asking the UI layer to prompt the user.
+
+    The caller (orchestrator_loop) should surface this as a needs_clarification
+    status and wait for the user to reply before continuing.
+    """
     log(
         f"External changes detected: {', '.join(files)}\n"
         "(possibly from another editor)\n"
-        "Integrate into Forge's context?"
+        "Pausing to ask user: integrate / revert / ignore?"
     )
-    return "integrate"  # Default; UI layer should override
+    return {"action": "ask", "files": files}
 
 
 def integrate_external_changes(
