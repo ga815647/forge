@@ -11,7 +11,15 @@ from . import agent as _agent
 from . import orchestrator_init as _init
 from . import orchestrator_loop as _loop
 from .git_ops import create_checkpoint, list_commits, rollback, squash_and_push
-from .security import detect_prompt_injection, is_safe_path
+from .security import (
+    ApprovedPaths,
+    SessionGuard,
+    check_package_install,
+    check_typosquatting,
+    detect_prompt_injection,
+    is_project_confirm,
+    is_safe_path,
+)
 
 # ── Dangerous pattern detection (Python deterministic) ───────────────────────
 
@@ -31,6 +39,65 @@ _DANGEROUS_PATTERNS = [
 _DANGEROUS_RE = re.compile(
     "|".join(_DANGEROUS_PATTERNS), re.IGNORECASE | re.MULTILINE
 )
+
+
+def _handle_package_install(
+    cmd: list[str],
+    approved: ApprovedPaths,
+    on_log: Callable[[str], None] | None = None,
+) -> bool:
+    """回傳 True 表示可以繼續執行，False 表示使用者拒絕。"""
+    is_install, packages = check_package_install(cmd)
+    if not is_install:
+        return True
+
+    # 已批量批准套件安裝，只提示 typosquatting，不擋
+    if approved.is_batch_approved("package_install"):
+        suspects = [(p, check_typosquatting(p)) for p in packages]
+        typos = [(p, s) for p, s in suspects if s]
+        if typos and on_log:
+            for pkg, suggestion in typos:
+                on_log(f"⚠️ 套件名稱疑似拼寫錯誤：{pkg!r}（接近 {suggestion!r}），請確認")
+        return True  # 不擋，繼續執行
+
+    # 需要逐次確認：回傳套件清單讓 UI 顯示
+    return False  # 由 UI 層處理確認邏輯
+
+
+def should_confirm_path(path: Path, project_root: Path, approved: ApprovedPaths) -> bool:
+    """回傳 True 表示需要使用者確認。"""
+    if approved.is_approved(path):
+        return False  # 已單獨批准
+    if is_project_confirm(path, project_root) and approved.is_batch_approved("build_config"):
+        return False  # 已批量批准建置設定
+    return is_project_confirm(path, project_root)
+
+
+def format_confirm_message(
+    reason: str,
+    detail: str,
+    rule: str,
+    continue_action: str = "確認，繼續執行",
+    cancel_action: str = "取消，重新規劃",
+) -> str:
+    """格式化確認訊息，讓使用者知道發生什麼事。"""
+    return (
+        f"⚠️ **Forge 需要你確認才能繼續**\n\n"
+        f"**原因：** {reason}\n"
+        f"**詳細：** {detail}\n"
+        f"**對應規則：** {rule}\n\n"
+        f"[{continue_action}] [批量批准此類操作] [{cancel_action}]"
+    )
+
+
+def format_hardblock_message(reason: str, detail: str) -> str:
+    """格式化 hard block 訊息。"""
+    return (
+        f"🔴 **Forge 已停止**\n\n"
+        f"**原因：** {reason}\n"
+        f"**詳細：** {detail}\n\n"
+        f"請修正後繼續，或切換到直接執行模式手動處理。"
+    )
 
 
 def safety_check(user_input: str) -> str | None:
@@ -101,6 +168,8 @@ def handle_input(
     review_mode: bool = False,
     round_num: int = 1,
     cost_tracker: CostTracker | None = None,
+    session_guard: SessionGuard | None = None,
+    approved_paths: ApprovedPaths | None = None,
 ) -> dict:
     """Route user input to direct mode or Forge mode.
 
@@ -163,6 +232,8 @@ def handle_input(
         }
     else:
         # Continuation: run one loop round
+        if session_guard is not None:
+            session_guard.check_and_increment()
         create_checkpoint(project_path, round_num)
         result = _loop.run(
             user_message=user_input,

@@ -7,7 +7,7 @@ from typing import Callable
 
 from . import monitor as _monitor
 from .agent_review import auto_review, quick_review
-from .security import safe_write, update_manifest
+from .security import is_safe_path, safe_write, scan_code, update_manifest
 
 # ── Anti-hallucination / command-confirm injections ───────────────────────────
 
@@ -140,6 +140,7 @@ def do(
     max_tokens: int = 100_000,
     on_token_warning: Callable[[], None] | None = None,
     on_token_kill: Callable[[], None] | None = None,
+    on_log: Callable[[str], None] | None = None,
 ) -> str:
     """Write-mode LLM call. Injects command-confirm prefix + anti-hallucination suffix."""
     full_prompt = (
@@ -170,7 +171,14 @@ def do(
     finally:
         _set_current_process(None)
 
-    return result["output"]
+    output = result["output"]
+    scan_warnings = scan_code(output)
+    if scan_warnings:
+        for w in scan_warnings:
+            if on_log:
+                on_log(f"⚠️ 安全掃描：{w}")
+    # 只記錄，不阻擋（由使用者決定是否繼續）
+    return output
 
 
 def compress(file_path: Path, engine: str, max_lines: int = 100) -> None:
@@ -198,8 +206,12 @@ def write_agent_file(
     content: str,
     engine: str,
     skip_review: bool = False,
+    project_root: Path | None = None,
 ) -> None:
     """All writes to .agent/*.md go through this function."""
+    # 路徑安全驗證（不受 skip_review 影響）
+    if project_root is not None and not is_safe_path(path, project_root):
+        raise ValueError(f"write_agent_file 拒絕寫入範圍外路徑：{path}")
     safe_write(path, content)
     update_manifest(path)
 

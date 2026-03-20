@@ -188,7 +188,7 @@ def extract_lessons(agent_dir: Path, engine: str) -> None:
     )
     result = _agent.think(prompt, [], engine, agent_dir, model="sonnet")
     if "無更新" not in result and result.strip():
-        _agent.write_agent_file(skill_path, result, engine, skip_review=False)
+        _agent.write_agent_file(skill_path, result, engine, skip_review=False, project_root=agent_dir.parent)
 
 
 def run_finale(agent_dir: Path, project_path: Path, engine: str, log: Callable) -> None:

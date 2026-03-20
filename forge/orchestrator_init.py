@@ -219,7 +219,7 @@ def _extract_and_write_files(preflight_output: str, agent_dir: Path, engine: str
     for fname, content in file_contents.items():
         if content:
             path = agent_dir / fname
-            _agent.write_agent_file(path, content, engine)
+            _agent.write_agent_file(path, content, engine, project_root=agent_dir.parent)
 
     # If parsing failed, write the whole output as preflight.md (already done by caller)
 

@@ -24,7 +24,7 @@ from .loop_helpers import (
     save_summary,
     update_upper_files,
 )
-from .security import safe_write, verify_manifest
+from .security import backup_before_do, is_safe_path, restore_from_backup, safe_write, verify_manifest
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
@@ -128,6 +128,10 @@ def run(
     ]
     do_context = [f for f in do_context if f.exists()]
 
+    # 備份 do() 前已修改的檔案，供範圍外寫入時還原
+    pre_changed = _get_changed_files(project_path)
+    backup_mapping = backup_before_do(pre_changed, project_path)
+
     do_result = _agent.do(
         read_file(agent_dir / "current_task.md"),
         context_files=do_context,
@@ -137,6 +141,13 @@ def run(
         on_token_warning=on_token_warning,
         on_token_kill=on_token_kill,
     )
+
+    # 驗證 do() 沒有寫出專案範圍外
+    changed = _get_changed_files(project_path)
+    outside = [f for f in changed if not is_safe_path(f, project_path)]
+    if outside:
+        restore_from_backup(backup_mapping)
+        raise ValueError(f"do() 寫出了專案目錄範圍外：{outside}")
 
     summary_path = (
         agent_dir / "lower" / "summaries" / f"round_{round_num:03d}.md"
@@ -252,3 +263,16 @@ def _get_upper_context_files(agent_dir: Path) -> list[Path]:
         if p.exists():
             files.append(p)
     return files
+
+
+def _get_changed_files(project_path: Path) -> list[Path]:
+    """Return list of files changed since last git commit."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD"],
+            cwd=str(project_path), capture_output=True, text=True
+        )
+        return [project_path / f for f in result.stdout.splitlines() if f]
+    except Exception:
+        return []
