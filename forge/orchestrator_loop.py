@@ -25,7 +25,7 @@ from .loop_helpers import (
     save_summary,
     update_upper_files,
 )
-from .security import backup_before_do, is_safe_path, restore_from_backup, safe_write, verify_manifest
+from .security import backup_before_do, is_safe_path, restore_from_backup, safe_write, update_manifest, verify_manifest
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
@@ -104,6 +104,28 @@ def run(
     tokens_used = 0
 
     if not use_lightweight:
+        # ── Review gate（在 think() 之前）────────────────────────────────
+        if review_mode:
+            prev_task = read_file(agent_dir / "current_task.md")
+            plan_preview = read_file(agent_dir / "plan.md")[:400] if (agent_dir / "plan.md").exists() else "（尚無計畫）"
+            review_msg = (
+                f"## 👀 Forge 暫停，等待你的確認\n\n"
+                f"### 目前計畫預覽\n{plan_preview}\n\n"
+                f"### 上一輪任務摘要\n{summarize_text(prev_task, 300) if prev_task else '（第一輪）'}\n\n"
+                f"---\n"
+                f"請回覆其中一個：\n"
+                f"- **繼續** — 照計畫執行這一輪\n"
+                f"- **修正：[你的意見]** — Forge 會把你的意見加入這輪任務再執行\n"
+                f"- **終止** — 停止整個任務\n"
+            )
+            log("👀 審核模式：等待使用者確認後才執行 think()")
+            return {
+                "status": "needs_review",
+                "round": round_num,
+                "tokens": tokens_used,
+                "summary": review_msg,
+            }
+
         log(f"🧠 第 {round_num} 輪 think()...")
         context_files = _get_upper_context_files(agent_dir)
         log(f"think() context files: {summarize_paths(context_files, base=agent_dir)}")
@@ -123,20 +145,12 @@ def run(
 
         current_task = parse_current_task(think_result, user_message)
         safe_write(agent_dir / "current_task.md", current_task)
+        update_manifest(agent_dir / "current_task.md")
         update_upper_files(agent_dir, think_result)
         log(
             "think() completed: "
             f"chars={len(think_result)}, current_task={summarize_text(current_task, 160)}"
         )
-
-        if review_mode:
-            log("👀 審核模式：請確認當前任務")
-            return {
-                "status": "needs_review",
-                "round": round_num,
-                "tokens": tokens_used,
-                "summary": current_task,
-            }
 
     else:
         log(f"⚡ 第 {round_num} 輪 lightweight（跳過 think）")

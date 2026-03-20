@@ -101,6 +101,23 @@ def format_hardblock_message(reason: str, detail: str) -> str:
     )
 
 
+def parse_review_reply(user_input: str) -> str:
+    """解析 needs_review 後的使用者回覆。
+    回傳 'terminate' | 'continue' | 'correction:<text>'
+    """
+    stripped = user_input.strip()
+    if stripped in ("終止", "停止", "取消", "terminate", "stop", "cancel"):
+        return "terminate"
+    if stripped.startswith("修正：") or stripped.startswith("修正:"):
+        correction = stripped.split("：", 1)[-1].split(":", 1)[-1].strip()
+        return f"correction:{correction}"
+    if stripped.startswith("Correction:") or stripped.startswith("correction:"):
+        correction = stripped.split(":", 1)[-1].strip()
+        return f"correction:{correction}"
+    # 繼續 or anything else we don't recognise
+    return "continue"
+
+
 def safety_check(user_input: str) -> str | None:
     """Return warning message if user_input contains dangerous patterns, else None."""
     match = _DANGEROUS_RE.search(user_input)
@@ -244,14 +261,53 @@ def handle_input(
             f"needs_review={result.get('needs_review', False)}, "
             f"plan_chars={len(result.get('plan', ''))}"
         )
+        _status = "needs_review" if result.get("needs_review") else "initialized"
+        if _status == "needs_review":
+            from . import main as _main_module
+            _sess = getattr(_main_module, "_session", None)
+            if _sess is not None:
+                _sess.pending_review = True
+                log("pending_review 已設為 True，等待使用者回覆")
         return {
-            "status": "needs_review" if result.get("needs_review") else "initialized",
+            "status": _status,
             "output": result.get("plan", "初始化完成"),
             "round": round_num,
         }
     else:
         # Continuation: run one loop round
         log("Found existing Forge state; continuing main loop")
+
+        # ── Review reply handling ──────────────────────────────────────
+        from . import main as _main_module
+        _sess = getattr(_main_module, "_session", None)
+        if _sess is not None and getattr(_sess, "pending_review", False):
+            _sess.pending_review = False
+            reply = parse_review_reply(user_input)
+            log(f"Review reply parsed: {reply}")
+
+            if reply == "terminate":
+                log("使用者選擇終止任務")
+                return {
+                    "status": "blocked",
+                    "output": "任務已由使用者終止。",
+                    "round": round_num,
+                }
+
+            if reply.startswith("correction:"):
+                correction_text = reply[len("correction:"):]
+                correction_path = agent_dir / "current_task.md"
+                existing = correction_path.read_text(encoding="utf-8", errors="replace") if correction_path.exists() else ""
+                from .security import safe_write, update_manifest
+                safe_write(correction_path, f"{existing}\n\n## 使用者修正意見\n{correction_text}")
+                update_manifest(correction_path)
+                log(f"Correction written to current_task.md: {summarize_text(correction_text, 80)}")
+                # Fall through: let think() pick up the correction
+                review_mode = False  # run full think() with correction
+
+            if reply == "continue":
+                log("使用者選擇繼續，跳過 think()，直接進 do()")
+                review_mode = False  # disable so loop doesn't gate again
+
         if session_guard is not None:
             log("Incrementing session guard turn counter")
             session_guard.check_and_increment()
@@ -289,6 +345,13 @@ def handle_input(
             notify("Forge ✅", f"任務完成（共 {round_num} 輪）")
         elif status == "blocked":
             notify("Forge ⚠️", "需要你的決定")
+
+        if status == "needs_review":
+            from . import main as _main_module
+            _sess = getattr(_main_module, "_session", None)
+            if _sess is not None:
+                _sess.pending_review = True
+                log("pending_review 已設為 True，等待使用者回覆")
 
         return {
             "status": status,

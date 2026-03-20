@@ -17,6 +17,7 @@ class _Session:
         self.round_num = 1
         self.project_path: Path | None = None
         self.session_guard = None
+        self.pending_review: bool = False
         self._lock = threading.Lock()
         self._init_tracker()
         self._init_approved()
@@ -41,6 +42,7 @@ class _Session:
         with self._lock:
             self.round_num = 1
             self.session_guard = None
+            self.pending_review = False
             self._init_tracker()
             self._init_approved()
 

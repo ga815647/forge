@@ -10,7 +10,7 @@ from . import agent as _agent
 from .live_log import make_live_logger, summarize_paths, summarize_text
 from . import prompts as _prompts
 from .init_chunker import chunk_file
-from .security import build_manifest, is_safe_path, safe_write, verify_manifest
+from .security import build_manifest, is_safe_path, safe_write, update_manifest, verify_manifest
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
@@ -97,14 +97,7 @@ def run(
 
     # ── Step 5: recon ──────────────────────────────────────────────────────
     log("🔍 偵察專案結構...")
-    recon_result = _agent.do(
-        _prompts.recon_prompt(project_path),
-        context_files=[],
-        engine=engine,
-        cwd=project_path,
-        model="sonnet",
-        on_log=log,
-    )
+    recon_result = _fast_recon(project_path)
     recon_path = agent_dir / "recon.md"
     safe_write(recon_path, recon_result)
     build_manifest(agent_dir)
@@ -127,6 +120,7 @@ def run(
         model="sonnet",
     )
     safe_write(agent_dir / "preflight.md", preflight_result)
+    update_manifest(agent_dir / "preflight.md")
     log(
         "Pre-flight response captured: "
         f"chars={len(preflight_result)}, preview={summarize_text(preflight_result, 160)}"
@@ -140,22 +134,21 @@ def run(
     )
     log("✅ Pre-flight 完成")
 
-    # ── Step 6b: chunk ordering (if big attachments) ───────────────────────
-    if chunk_titles:
+    # ── Step 6b: chunk ordering (if big attachments) ──────────────────────
+    chunks_dir = agent_dir / "chunks"
+    chunk_files = list(chunks_dir.glob("*.md"))
+    if chunk_files:
         log("📋 排序 chunks 執行順序...")
-        chunks_dir = agent_dir / "chunks"
-        chunk_files = list(chunks_dir.glob("*.md"))
-        if chunk_files:
-            log(f"Chunk ordering input files: {summarize_paths(chunk_files, base=agent_dir)}")
-            ordering_prompt = (
-                f"根據以下 chunks 列表，決定最合理的讀取順序：\n"
-                + "\n".join(f"- {c.name}" for c in chunk_files)
-                + "\n\n輸出有序列表（chunk 名稱），不要解釋。"
-            )
-            ordering_result = _agent.think(
-                ordering_prompt, [], engine, agent_dir, model="sonnet"
-            )
-            log(f"Chunk ordering suggestion: {summarize_text(ordering_result, 160)}")
+        log(f"Chunk ordering input files: {summarize_paths(chunk_files, base=agent_dir)}")
+        ordering_prompt = (
+            f"根據以下 chunks 列表，決定最合理的讀取順序：\n"
+            + "\n".join(f"- {c.name}" for c in chunk_files)
+            + "\n\n輸出有序列表（chunk 名稱），不要解釋。"
+        )
+        ordering_result = _agent.think(
+            ordering_prompt, [], engine, agent_dir, model="sonnet"
+        )
+        log(f"Chunk ordering suggestion: {summarize_text(ordering_result, 160)}")
 
     # ── Step 7: large task estimation ─────────────────────────────────────
     plan_path = agent_dir / "plan.md"
@@ -178,9 +171,18 @@ def run(
 
     # ── Step 8: review mode gate ──────────────────────────────────────────
     if review_mode and plan_content:
-        log("👀 審核模式：等待使用者確認 plan...")
+        log("👀 審核模式：等待使用者確認 plan")
+        review_msg = (
+            f"## 👀 Forge 暫停，等待你確認初始計畫\n\n"
+            f"{plan_content}\n\n"
+            f"---\n"
+            f"請回覆其中一個：\n"
+            f"- **繼續** — 照計畫開始執行\n"
+            f"- **修正：[你的意見]** — Forge 會重新調整計畫再問你\n"
+            f"- **終止** — 放棄這個任務\n"
+        )
         return {
-            "plan": plan_content,
+            "plan": review_msg,
             "agent_dir": agent_dir,
             "needs_review": True,
         }
@@ -202,6 +204,65 @@ def run(
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _fast_recon(project_path: Path) -> str:
+    """Pure-Python project recon. No LLM call."""
+    import os
+    import subprocess
+
+    lines: list[str] = ["# 偵察結果（快速模式）\n"]
+
+    # 1. Directory structure (2 levels)
+    skip = {"node_modules", ".venv", "venv", ".git", "dist", "build", "__pycache__"}
+    tree_lines: list[str] = []
+    for root, dirs, files in os.walk(project_path):
+        dirs[:] = [d for d in dirs if d not in skip]
+        depth = len(Path(root).relative_to(project_path).parts)
+        if depth > 2:
+            dirs.clear()
+            continue
+        indent = "  " * depth
+        rel = Path(root).relative_to(project_path)
+        tree_lines.append(f"{indent}{rel}/")
+        for f in files:
+            tree_lines.append(f"{indent}  {f}")
+    lines.append("## 目錄結構\n```\n" + "\n".join(tree_lines[:120]) + "\n```\n")
+
+    # 2. Key config files
+    config_names = ["package.json", "pyproject.toml", "Cargo.toml", "README.md",
+                    "requirements.txt", ".env.example", "go.mod"]
+    found_configs: list[str] = []
+    for name in config_names:
+        p = project_path / name
+        if p.exists():
+            try:
+                content = p.read_text(encoding="utf-8", errors="replace")[:600]
+                found_configs.append(f"### {name}\n```\n{content}\n```")
+            except OSError:
+                found_configs.append(f"### {name}\n（讀取失敗）")
+    if found_configs:
+        lines.append("## 主要設定檔\n" + "\n\n".join(found_configs) + "\n")
+
+    # 3. Git log
+    try:
+        result = subprocess.run(
+            ["git", "log", "--oneline", "-10"],
+            cwd=str(project_path), capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            lines.append("## Git log（最近 10 筆）\n```\n" + result.stdout.strip() + "\n```\n")
+    except Exception:
+        pass
+
+    # 4. File count summary
+    total_files = sum(
+        len(files) for _, dirs, files in os.walk(project_path)
+        if not any(skip_dir in Path(_).parts for skip_dir in skip)
+    )
+    lines.append(f"## 統計\n- 偵測到約 {total_files} 個檔案")
+
+    return "\n".join(lines)
 
 
 def _prompt_existing_agent(agent_dir: Path, on_log: Callable | None) -> None:
