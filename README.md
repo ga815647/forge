@@ -9,7 +9,7 @@ AI 驅動的程式碼重構助手，以 Gradio UI 操作，內建安全審查、
 - **Git 整合** — 每輪自動建立 checkpoint，支援一鍵回滾
 - **成本追蹤** — 記錄每輪 token 用量，顯示累計費用摘要
 - **自動審查** — 內建 `agent_review` 對輸出進行 quick / auto review
-- **197 tests** — 完整單元測試覆蓋（pytest）
+- **197 tests** — 完整單元測試覆蓋
 
 ## 目錄結構
 
