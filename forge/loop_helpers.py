@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import agent as _agent
+from .live_log import summarize_paths, summarize_text
 from . import prompts as _prompts
 from .security import safe_write
 
@@ -19,6 +20,7 @@ def read_file(path: Path) -> str:
 
 
 def compress_if_needed(agent_dir: Path, engine: str, log: Callable) -> None:
+    compressed = 0
     for subdir in ["upper", "lower"]:
         target = agent_dir / subdir
         if not target.exists():
@@ -27,6 +29,11 @@ def compress_if_needed(agent_dir: Path, engine: str, log: Callable) -> None:
             if md.read_text(encoding="utf-8", errors="replace").count("\n") > 100:
                 log(f"Compressing {md.relative_to(agent_dir)}")
                 _agent.compress(md, engine)
+                compressed += 1
+    if compressed == 0:
+        log("No context files exceeded the compression threshold")
+    else:
+        log(f"Compression finished; compressed_files={compressed}")
 
 
 def detect_external_changes(project_path: Path) -> list[str]:
@@ -67,6 +74,10 @@ def integrate_external_changes(
         diff = result.stdout[:3000]
     except (OSError, FileNotFoundError):
         diff = "\n".join(files)
+    log(
+        f"Integrating external changes into context: files={summarize_paths(files)}, "
+        f"diff_chars={len(diff)}"
+    )
 
     recon_result = _agent.do(
         f"Report external changes (only facts, no speculation):\n\n{diff}",
@@ -74,7 +85,10 @@ def integrate_external_changes(
     )
     context_path = agent_dir / "upper" / "context.md"
     safe_write(context_path, read_file(context_path) + f"\n\n## External changes\n{recon_result[:500]}")
-    log("External changes integrated")
+    log(
+        f"External changes integrated into {context_path}; "
+        f"summary={summarize_text(recon_result, 160)}"
+    )
 
 
 def revert_external(files: list[str], project_path: Path, log: Callable) -> None:
@@ -200,9 +214,13 @@ def run_finale(agent_dir: Path, project_path: Path, engine: str, log: Callable) 
             f"## meta.md\n{read_file(agent_dir / 'meta.md')}\n\n"
             "Run all checks. Write results into final_check.md."
         ),
-        context_files=[], engine=engine, cwd=project_path, model="sonnet",
+        context_files=[], engine=engine, cwd=project_path, model="sonnet", on_log=log,
     )
     safe_write(agent_dir / "final_check.md", final_result)
+    log(
+        f"final_check.md written: chars={len(final_result)}, "
+        f"preview={summarize_text(final_result, 160)}"
+    )
 
     log("Generating docs...")
     doc_result = _agent.think(
@@ -213,8 +231,12 @@ def run_finale(agent_dir: Path, project_path: Path, engine: str, log: Callable) 
         ),
         context_files=[], engine=engine, cwd=agent_dir, model="sonnet",
     )
+    log(
+        f"Doc generation plan prepared: chars={len(doc_result)}, "
+        f"preview={summarize_text(doc_result, 160)}"
+    )
     _agent.do(
         f"Write appropriate docs to the project directory:\n\n{doc_result}",
-        context_files=[], engine=engine, cwd=project_path, model="sonnet",
+        context_files=[], engine=engine, cwd=project_path, model="sonnet", on_log=log,
     )
     log("Finale complete")

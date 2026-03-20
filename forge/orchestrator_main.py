@@ -11,6 +11,7 @@ from . import agent as _agent
 from . import orchestrator_init as _init
 from . import orchestrator_loop as _loop
 from .git_ops import create_checkpoint, list_commits, rollback, squash_and_push
+from .live_log import make_live_logger, summarize_paths, summarize_text
 from .security import (
     ApprovedPaths,
     SessionGuard,
@@ -181,12 +182,19 @@ def handle_input(
         {"status": str, "output": str, "round": int}
     """
 
-    def log(msg: str) -> None:
-        if on_log:
-            on_log(msg)
+    log = make_live_logger(on_log, f"router r{round_num:03d}")
+    log(
+        "Received request: "
+        f"mode={mode}, engine={engine}, review_mode={review_mode}, "
+        f"project={project_path}, uploads={len(uploaded_files)}"
+    )
+    log(f"User input preview: {summarize_text(user_input, 180)}")
+    if uploaded_files:
+        log(f"Uploaded files: {summarize_paths(uploaded_files)}")
 
     # ── Prompt injection check ────────────────────────────────────────────
     if detect_prompt_injection(user_input):
+        log("Blocked request because prompt injection patterns were detected")
         return {
             "status": "blocked",
             "output": "⚠️ 偵測到可能的 prompt injection 攻擊，已阻止執行。",
@@ -195,28 +203,34 @@ def handle_input(
 
     # ── Direct execution mode ─────────────────────────────────────────────
     if mode == "direct":
+        log("Routing to direct execution mode")
         warning = safety_check(user_input)
         if warning:
+            log(f"Direct execution paused for confirmation: {summarize_text(warning)}")
             return {
                 "status": "needs_confirm",
                 "output": warning,
                 "round": round_num,
             }
+        log("Calling agent.do() with 0 context files")
         output = _agent.do(
             user_input,
             context_files=[],
             engine=engine,
             cwd=project_path,
             model="opus",
+            on_log=log,
         )
+        log(f"Direct execution completed; output_chars={len(output)}")
         return {"status": "done", "output": output, "round": round_num}
 
     # ── Forge mode ────────────────────────────────────────────────────────
     agent_dir = project_path / ".agent"
+    log(f"Using agent directory: {agent_dir}")
 
     if not agent_dir.exists() or not (agent_dir / "purpose.md").exists():
         # First time initialization
-        log("🚀 首次啟動 Forge 初始化...")
+        log("Forge state is missing or incomplete; starting initialization flow")
         result = _init.run(
             user_input,
             uploaded_files,
@@ -225,6 +239,11 @@ def handle_input(
             on_log=on_log,
             review_mode=review_mode,
         )
+        log(
+            "Initialization finished: "
+            f"needs_review={result.get('needs_review', False)}, "
+            f"plan_chars={len(result.get('plan', ''))}"
+        )
         return {
             "status": "needs_review" if result.get("needs_review") else "initialized",
             "output": result.get("plan", "初始化完成"),
@@ -232,9 +251,26 @@ def handle_input(
         }
     else:
         # Continuation: run one loop round
+        log("Found existing Forge state; continuing main loop")
         if session_guard is not None:
+            log("Incrementing session guard turn counter")
             session_guard.check_and_increment()
+            log(
+                "Session guard state: "
+                f"turns={session_guard.turns}/{session_guard.max_turns}, "
+                f"tokens={session_guard.tokens:,}/{session_guard.max_tokens:,}"
+            )
+        log(f"Creating checkpoint before round {round_num}")
         create_checkpoint(project_path, round_num)
+        commits = list_commits(project_path, max_count=1)
+        if commits:
+            latest = commits[0]
+            log(
+                "Checkpoint created: "
+                f"{latest.get('hash', '')[:8]} {summarize_text(latest.get('msg', ''), 90)}"
+            )
+        else:
+            log("Checkpoint created; no commit metadata available")
         result = _loop.run(
             user_message=user_input,
             project_path=project_path,
@@ -244,6 +280,11 @@ def handle_input(
             review_mode=review_mode,
         )
         status = result.get("status", "continue")
+        log(
+            "Loop round finished: "
+            f"status={status}, tokens={result.get('tokens', 0)}, "
+            f"summary={summarize_text(result.get('summary', ''), 120)}"
+        )
         if status == "done":
             notify("Forge ✅", f"任務完成（共 {round_num} 輪）")
         elif status == "blocked":

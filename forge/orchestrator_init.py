@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import agent as _agent
+from .live_log import make_live_logger, summarize_paths, summarize_text
 from . import prompts as _prompts
 from .init_chunker import chunk_file
 from .security import build_manifest, is_safe_path, safe_write, verify_manifest
@@ -24,11 +25,15 @@ def run(
 ) -> dict:
     """Run first-time initialization. Returns {"plan": str, "agent_dir": Path}."""
 
-    def log(msg: str) -> None:
-        if on_log:
-            on_log(msg)
-
+    log = make_live_logger(on_log, "init")
     agent_dir = project_path / ".agent"
+    log(
+        "Starting initialization: "
+        f"project={project_path}, engine={engine}, review_mode={review_mode}, "
+        f"uploads={len(uploaded_files)}"
+    )
+    if uploaded_files:
+        log(f"Incoming uploads: {summarize_paths(uploaded_files)}")
 
     # ── Step 1: detect engine ──────────────────────────────────────────────
     log(f"🔍 使用 engine: {engine}")
@@ -36,25 +41,31 @@ def run(
     # ── Step 2: check for existing .agent/ ────────────────────────────────
     if agent_dir.exists() and (agent_dir / "purpose.md").exists():
         log("📂 發現現有 .agent/ 目錄")
-        _prompt_existing_agent(agent_dir, on_log)
+        _prompt_existing_agent(agent_dir, log)
 
     # Clean up stale .tmp files
+    removed_tmp = 0
     if agent_dir.exists():
         for tmp in agent_dir.rglob("*.tmp"):
             try:
                 tmp.unlink()
+                removed_tmp += 1
             except OSError:
                 pass
+    log(f"Temporary cleanup finished; removed_tmp_files={removed_tmp}")
 
     # Create directory structure
-    for subdir in ["upper", "lower", "lower/summaries", "chunks", "uploads"]:
+    created_dirs = ["upper", "lower", "lower/summaries", "chunks", "uploads"]
+    for subdir in created_dirs:
         (agent_dir / subdir).mkdir(parents=True, exist_ok=True)
+    log(f"Ensured agent directories: {', '.join(created_dirs)}")
 
     # ── Step 3: handle .zip uploads ───────────────────────────────────────
     for f in uploaded_files:
         if f.suffix.lower() == ".zip" and is_safe_path(f, f.parent):
             log(f"📦 解壓縮: {f.name}")
             _extract_zip(f, project_path)
+            log(f"Archive extracted into project root: {project_path}")
 
     # ── Step 4: copy uploaded files + chunk large ones ────────────────────
     log("📎 處理上傳檔案...")
@@ -63,14 +74,26 @@ def run(
         if f.suffix.lower() == ".zip":
             continue
         dest = agent_dir / "uploads" / f.name
+        log(f"Copying upload into agent workspace: src={f} -> dest={dest}")
         _copy_normalized(f, dest)
-        lines = dest.read_text(encoding="utf-8", errors="replace").splitlines()
+        dest_text = dest.read_text(encoding="utf-8", errors="replace")
+        lines = dest_text.splitlines()
+        log(
+            "Upload normalized: "
+            f"name={f.name}, lines={len(lines)}, chars={len(dest_text)}"
+        )
         if len(lines) > 300:
             log(f"✂️ 切割大檔案: {f.name} ({len(lines)} 行)")
             titles = chunk_file(dest, agent_dir / "chunks", f.name)
             chunk_titles.extend(titles)
+            log(
+                "Chunking complete: "
+                f"file={f.name}, chunks={len(titles)}, sample={summarize_text(' | '.join(titles), 160)}"
+            )
         else:
             chunk_titles.append(f"[{f.name}] ({len(lines)} 行)")
+            log(f"Upload kept as single chunk reference: {f.name}")
+    log(f"Upload processing finished; chunk_entries={len(chunk_titles)}")
 
     # ── Step 5: recon ──────────────────────────────────────────────────────
     log("🔍 偵察專案結構...")
@@ -80,14 +103,22 @@ def run(
         engine=engine,
         cwd=project_path,
         model="sonnet",
+        on_log=log,
     )
     recon_path = agent_dir / "recon.md"
     safe_write(recon_path, recon_result)
     build_manifest(agent_dir)
-    log("✅ recon.md 完成")
+    log(
+        "Recon written: "
+        f"path={recon_path}, chars={len(recon_result)}, preview={summarize_text(recon_result, 140)}"
+    )
+    log("Manifest rebuilt after recon output")
 
     # ── Step 6: pre-flight think() ────────────────────────────────────────
-    log("🧠 Pre-flight 分析...")
+    log(
+        "🧠 Pre-flight 分析..."
+        f" chunk_context={len(chunk_titles)}, recon_chars={len(recon_result)}"
+    )
     preflight_result = _agent.think(
         _prompts.preflight_prompt(recon_result, user_input, chunk_titles),
         context_files=[],
@@ -96,9 +127,17 @@ def run(
         model="sonnet",
     )
     safe_write(agent_dir / "preflight.md", preflight_result)
+    log(
+        "Pre-flight response captured: "
+        f"chars={len(preflight_result)}, preview={summarize_text(preflight_result, 160)}"
+    )
 
     # Parse and write individual files from preflight output
-    _extract_and_write_files(preflight_result, agent_dir, engine)
+    written_files = _extract_and_write_files(preflight_result, agent_dir, engine)
+    log(
+        "Pre-flight files materialized: "
+        f"count={len(written_files)}, files={', '.join(written_files) if written_files else '(none)'}"
+    )
     log("✅ Pre-flight 完成")
 
     # ── Step 6b: chunk ordering (if big attachments) ───────────────────────
@@ -107,22 +146,35 @@ def run(
         chunks_dir = agent_dir / "chunks"
         chunk_files = list(chunks_dir.glob("*.md"))
         if chunk_files:
+            log(f"Chunk ordering input files: {summarize_paths(chunk_files, base=agent_dir)}")
             ordering_prompt = (
                 f"根據以下 chunks 列表，決定最合理的讀取順序：\n"
                 + "\n".join(f"- {c.name}" for c in chunk_files)
                 + "\n\n輸出有序列表（chunk 名稱），不要解釋。"
             )
-            _agent.think(
+            ordering_result = _agent.think(
                 ordering_prompt, [], engine, agent_dir, model="sonnet"
             )
+            log(f"Chunk ordering suggestion: {summarize_text(ordering_result, 160)}")
 
     # ── Step 7: large task estimation ─────────────────────────────────────
     plan_path = agent_dir / "plan.md"
     plan_content = ""
     if plan_path.exists():
         plan_content = plan_path.read_text(encoding="utf-8", errors="replace")
+        step_count = sum(
+            1
+            for line in plan_content.splitlines()
+            if line.strip().startswith(("- ", "* ", "1.", "2.", "3."))
+        )
+        log(
+            f"Plan detected: path={plan_path}, chars={len(plan_content)}, "
+            f"estimated_steps={step_count}"
+        )
         if _is_large_task(plan_content):
             log("📅 大型任務，沙盤推演中...")
+    else:
+        log("No plan.md was produced during initialization")
 
     # ── Step 8: review mode gate ──────────────────────────────────────────
     if review_mode and plan_content:
@@ -135,6 +187,11 @@ def run(
 
     # ── Step 9: init upper/context.md ─────────────────────────────────────
     _init_context(agent_dir, engine, recon_result)
+    context_path = agent_dir / "upper" / "context.md"
+    log(
+        "Context initialized: "
+        f"path={context_path}, chars={len(context_path.read_text(encoding='utf-8', errors='replace'))}"
+    )
     log("✅ 初始化完成，進入主迴圈")
 
     return {
@@ -177,7 +234,7 @@ def _copy_normalized(src: Path, dest: Path) -> None:
         shutil.copy2(str(src), str(dest))
 
 
-def _extract_and_write_files(preflight_output: str, agent_dir: Path, engine: str) -> None:
+def _extract_and_write_files(preflight_output: str, agent_dir: Path, engine: str) -> list[str]:
     """Parse preflight output and write purpose.md, architecture.md, skill.md, meta.md, plan.md."""
     sections = {
         "purpose.md": ["purpose.md", "目的", "purpose"],
@@ -216,12 +273,15 @@ def _extract_and_write_files(preflight_output: str, agent_dir: Path, engine: str
         file_contents[current_file] = "\n".join(current_content).strip()
 
     # Write extracted files
+    written: list[str] = []
     for fname, content in file_contents.items():
         if content:
             path = agent_dir / fname
             _agent.write_agent_file(path, content, engine, project_root=agent_dir.parent)
+            written.append(fname)
 
     # If parsing failed, write the whole output as preflight.md (already done by caller)
+    return written
 
 
 def _init_context(agent_dir: Path, engine: str, recon: str) -> None:

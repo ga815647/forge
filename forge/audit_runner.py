@@ -4,6 +4,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Callable
 
 from .security import is_safe_path
 
@@ -99,14 +100,31 @@ def detect_tools(project_path: Path) -> list[dict]:
 # ── Run audit ─────────────────────────────────────────────────────────────────
 
 
-def run_audit(project_path: Path) -> list[dict]:
+def run_audit(
+    project_path: Path,
+    on_log: Callable[[str], None] | None = None,
+) -> list[dict]:
     """Run all detected tools. Returns list of result dicts."""
     tools = detect_tools(project_path)
     results: list[dict] = []
+    if on_log:
+        on_log(
+            f"Audit tool detection complete: count={len(tools)}, "
+            f"tools={', '.join(tool['name'] for tool in tools) if tools else '(none)'}"
+        )
 
     for tool in tools:
+        if on_log:
+            on_log(
+                f"Running audit tool: name={tool['name']}, type={tool['type']}, cmd={tool['cmd']}"
+            )
         result = _run_tool(tool["cmd"], project_path)
         level = _classify(result["returncode"], result["output"])
+        if on_log:
+            on_log(
+                f"Audit tool finished: name={tool['name']}, returncode={result['returncode']}, "
+                f"level={level}, output_chars={len(result['output'])}"
+            )
         results.append(
             {
                 "name": tool["name"],
@@ -119,6 +137,8 @@ def run_audit(project_path: Path) -> list[dict]:
         )
 
     if not tools:
+        if on_log:
+            on_log("No audit tools detected; emitting informational placeholder result")
         results.append(
             {
                 "name": "no-tools",
@@ -136,7 +156,10 @@ def run_audit(project_path: Path) -> list[dict]:
 # ── Security scan ─────────────────────────────────────────────────────────────
 
 
-def run_security_scan(project_path: Path) -> list[dict]:
+def run_security_scan(
+    project_path: Path,
+    on_log: Callable[[str], None] | None = None,
+) -> list[dict]:
     """Scan for hardcoded secrets and known vulnerabilities."""
     results: list[dict] = []
 
@@ -150,15 +173,26 @@ def run_security_scan(project_path: Path) -> list[dict]:
     ]
 
     for pattern in patterns:
-        proc = subprocess.run(
-            ["grep", "-rn", "--include=*.py", "--include=*.js", "--include=*.ts",
-             "--include=*.env", "-i", pattern, str(project_path)],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
+        if on_log:
+            on_log(f"Security grep scan: pattern={pattern}")
+        try:
+            proc = subprocess.run(
+                ["grep", "-rn", "--include=*.py", "--include=*.js", "--include=*.ts",
+                 "--include=*.env", "-i", pattern, str(project_path)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except FileNotFoundError:
+            if on_log:
+                on_log("Skipping grep-based secret scan because grep is unavailable")
+            break
         if proc.stdout.strip():
+            if on_log:
+                on_log(
+                    f"Security grep matched: pattern={pattern}, output_chars={len(proc.stdout.strip())}"
+                )
             results.append(
                 {
                     "name": "hardcoded-secret",
@@ -172,6 +206,8 @@ def run_security_scan(project_path: Path) -> list[dict]:
     # pip-audit
     req = project_path / "requirements.txt"
     if req.exists() and shutil.which("pip-audit"):
+        if on_log:
+            on_log(f"Running dependency security audit: pip-audit -r {req.name}")
         proc = subprocess.run(
             ["pip-audit", "-r", str(req)],
             capture_output=True,
@@ -181,6 +217,11 @@ def run_security_scan(project_path: Path) -> list[dict]:
             errors="replace",
         )
         level = "🔴 FAIL" if proc.returncode != 0 else "🔵 INFO"
+        if on_log:
+            on_log(
+                f"pip-audit finished: returncode={proc.returncode}, level={level}, "
+                f"output_chars={len(proc.stdout + proc.stderr)}"
+            )
         results.append(
             {
                 "name": "pip-audit",
@@ -195,6 +236,8 @@ def run_security_scan(project_path: Path) -> list[dict]:
     # npm audit
     pkg_json = project_path / "package.json"
     if pkg_json.exists() and shutil.which("npm"):
+        if on_log:
+            on_log("Running dependency security audit: npm audit --json")
         proc = subprocess.run(
             ["npm", "audit", "--json"],
             capture_output=True,
@@ -204,6 +247,11 @@ def run_security_scan(project_path: Path) -> list[dict]:
             errors="replace",
         )
         level = "🔴 FAIL" if proc.returncode != 0 else "🔵 INFO"
+        if on_log:
+            on_log(
+                f"npm audit finished: returncode={proc.returncode}, level={level}, "
+                f"output_chars={len(proc.stdout)}"
+            )
         results.append(
             {
                 "name": "npm-audit",
@@ -216,6 +264,8 @@ def run_security_scan(project_path: Path) -> list[dict]:
         )
 
     if not results:
+        if on_log:
+            on_log("Security scan found no matches or dependency audit issues")
         results.append(
             {
                 "name": "opensec",
